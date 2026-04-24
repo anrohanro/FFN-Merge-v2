@@ -4,8 +4,8 @@ FFN Clustering and Merging Pipeline for GPT-2
 Iteratively merges similar FFN layers by:
   1. Computing pairwise base distances between cluster representatives
   2. Selecting the closest pair
-  3. Aligning bases via combined loss (LM + align + anchor)
-  4. Committing the merge if ΔL is within threshold
+  3. Soft-aligning candidate cluster bases via combined loss (LM + align + anchor)
+  4. Collapsing to one representative base if ΔL is within threshold
   5. Repeating until target cluster count is reached
 """
 
@@ -72,21 +72,6 @@ def wrap_mlp_with_lora(block: nn.Module, rank: int = LORA_RANK) -> None:
         block.mlp.c_fc   = LoRAConv1D(block.mlp.c_fc,   rank)
     if not isinstance(block.mlp.c_proj, LoRAConv1D):
         block.mlp.c_proj = LoRAConv1D(block.mlp.c_proj, rank)
-
-
-def reset_lora(block: nn.Module) -> None:
-    """Zero-initialise LoRA adapters (A small random, B zero) after a base change."""
-    in_fc   = block.mlp.c_fc.conv.weight.shape[0]
-    out_fc  = block.mlp.c_fc.conv.weight.shape[1]
-    in_pr   = block.mlp.c_proj.conv.weight.shape[0]
-    out_pr  = block.mlp.c_proj.conv.weight.shape[1]
-    dev     = block.mlp.c_fc.conv.weight.device
-
-    block.mlp.c_fc.A   = nn.Parameter(torch.randn(in_fc, LORA_RANK, device=dev) * 0.01)
-    block.mlp.c_fc.B   = nn.Parameter(torch.zeros(LORA_RANK, out_fc, device=dev))
-    block.mlp.c_proj.A = nn.Parameter(torch.randn(in_pr, LORA_RANK, device=dev) * 0.01)
-    block.mlp.c_proj.B = nn.Parameter(torch.zeros(LORA_RANK, out_pr, device=dev))
-
 
 # =============================================================================
 # MLP FORWARD HELPERS
@@ -340,78 +325,7 @@ def pick_merge_candidate(
 
 
 # =============================================================================
-# PHASE 2 — PREPARE MERGE (initialize shared base + reset LoRAs)
-# =============================================================================
-def prepare_merge(
-    model,
-    registry: ClusterRegistry,
-    cid_a: int,
-    cid_b: int,
-) -> int:
-    """
-    1. Average f_A^base and f_B^base into a new shared base (stored in cluster A's layer).
-    2. Point cluster B members' Conv1D to the same shared weights.
-    3. Reset all LoRA adapters for all members of both clusters.
-    Returns the layer index that now holds the shared base.
-    """
-    layers = model.transformer.h
-    ca     = registry.clusters[cid_a]
-    cb     = registry.clusters[cid_b]
-
-    shared_idx = ca.shared_layer_idx
-    other_idx  = cb.shared_layer_idx
-
-    shared_block = layers[shared_idx]
-    other_block  = layers[other_idx]
-
-    # Ensure both blocks have LoRA wrappers
-    wrap_mlp_with_lora(shared_block)
-    wrap_mlp_with_lora(other_block)
-
-    # ---- Average the two base Conv1D weights ----
-    with torch.no_grad():
-        # c_fc
-        shared_block.mlp.c_fc.conv.weight.data.add_(
-            other_block.mlp.c_fc.conv.weight.data
-        ).div_(2)
-        shared_block.mlp.c_fc.conv.bias.data.add_(
-            other_block.mlp.c_fc.conv.bias.data
-        ).div_(2)
-        # c_proj
-        shared_block.mlp.c_proj.conv.weight.data.add_(
-            other_block.mlp.c_proj.conv.weight.data
-        ).div_(2)
-        shared_block.mlp.c_proj.conv.bias.data.add_(
-            other_block.mlp.c_proj.conv.bias.data
-        ).div_(2)
-
-    # ---- Point all cluster B members to the shared base ----
-    for m in cb.members:
-        if m == other_idx:
-            continue  # will be re-pointed below
-        wrap_mlp_with_lora(layers[m])
-    # Point other_block's Conv1D to shared_block's Conv1D parameters
-    other_block.mlp.c_fc.conv   = shared_block.mlp.c_fc.conv
-    other_block.mlp.c_proj.conv = shared_block.mlp.c_proj.conv
-
-    # Also point every member layer in both clusters to the same shared Conv1D
-    all_members = ca.members + cb.members
-    for m in all_members:
-        if m == shared_idx:
-            continue
-        wrap_mlp_with_lora(layers[m])
-        layers[m].mlp.c_fc.conv   = shared_block.mlp.c_fc.conv
-        layers[m].mlp.c_proj.conv = shared_block.mlp.c_proj.conv
-
-    # ---- Reset LoRA for all members ----
-    for m in all_members:
-        reset_lora(layers[m])
-
-    return shared_idx
-
-
-# =============================================================================
-# PHASE 3 — ALIGNMENT TRAINING
+# PHASE 2 — SOFT ALIGNMENT TRAINING
 # =============================================================================
 def alignment_training(
     model,
@@ -421,15 +335,16 @@ def alignment_training(
     cid_a: int,
     cid_b: int,
     frozen_originals: Dict[int, nn.Module],
-    shared_layer_idx: int,
+    rep_a_layer_idx: int,
+    rep_b_layer_idx: int,
     steps: int = ALIGN_STEPS,
 ) -> None:
     """
-    Train shared base + all member LoRAs with:
-        L = L_LM + λ*(L_align + μ*L_anchor)
+    Train two representative bases + all member LoRAs with:
+        L = L_LM + λ*L_align + μ*L_anchor
 
-    L_align  : distance between shared base output and each frozen original,
-               averaged over all member activations.
+    L_align  : distance between representative base outputs, averaged over
+               activations from all members in both candidate clusters.
     L_anchor : full function (base+LoRA) vs frozen original for every member.
     """
     layers      = model.transformer.h
@@ -437,18 +352,28 @@ def alignment_training(
         registry.clusters[cid_a].members + registry.clusters[cid_b].members
     )
 
-    shared_block = layers[shared_layer_idx]
+    rep_a_block = layers[rep_a_layer_idx]
+    rep_b_block = layers[rep_b_layer_idx]
 
     # ---- Collect trainable parameters ----
     params = []
-    # Shared base Conv1D (only once — all members point to same object)
-    params += list(shared_block.mlp.c_fc.conv.parameters())
-    params += list(shared_block.mlp.c_proj.conv.parameters())
-    # Per-member LoRA
+    seen_param_ids = set()
+
+    def add_params(new_params) -> None:
+        for p in new_params:
+            if id(p) not in seen_param_ids:
+                params.append(p)
+                seen_param_ids.add(id(p))
+
+    add_params(rep_a_block.mlp.c_fc.conv.parameters())
+    add_params(rep_a_block.mlp.c_proj.conv.parameters())
+    add_params(rep_b_block.mlp.c_fc.conv.parameters())
+    add_params(rep_b_block.mlp.c_proj.conv.parameters())
+
     for m in all_members:
         blk = layers[m]
-        params += [blk.mlp.c_fc.A, blk.mlp.c_fc.B,
-                   blk.mlp.c_proj.A, blk.mlp.c_proj.B]
+        add_params([blk.mlp.c_fc.A, blk.mlp.c_fc.B,
+                    blk.mlp.c_proj.A, blk.mlp.c_proj.B])
 
     optimizer = torch.optim.AdamW(params, lr=LR_ALIGN)
     warmup_steps = int(WARMUP_FRAC * steps)
@@ -465,29 +390,20 @@ def alignment_training(
         )
         loss_lm = outputs.loss
 
-        # ---- Build per-layer LN2 inputs from cached hidden states ----
-        # outputs.hidden_states[i] is the hidden state BEFORE layer i processes it
-        # We need LN2(hidden_state) which is what the MLP sees as input
         loss_align  = torch.tensor(0.0, device=DEVICE)
         loss_anchor = torch.tensor(0.0, device=DEVICE)
 
         for m in all_members:
-            # hidden_states index: 0 = embedding, 1..12 = after each layer
-            # So LN2 input for layer m = hidden_states[m] passed through ln_2
             h_raw = outputs.hidden_states[m]          # before layer m
             h_ln  = layers[m].ln_2(h_raw)             # LN2 output = MLP input
 
-            # Base output for this member
-            base_out = base_mlp_forward(layers[m], h_ln)
+            rep_a_out = base_mlp_forward(rep_a_block, h_ln)
+            rep_b_out = base_mlp_forward(rep_b_block, h_ln)
+            loss_align = loss_align + ((rep_a_out - rep_b_out) ** 2).mean()
 
-            # Original (frozen) output
             with torch.no_grad():
                 orig_out = full_mlp_forward(frozen_originals[m], h_ln.detach())
 
-            # Align: shared base vs original
-            loss_align = loss_align + ((base_out - orig_out.detach()) ** 2).mean()
-
-            # Full output for anchor
             full_out = full_mlp_forward(layers[m], h_ln)
             loss_anchor = loss_anchor + ((full_out - orig_out.detach()) ** 2).mean()
 
@@ -497,7 +413,7 @@ def alignment_training(
         # Lambda warmup schedule
         lam = LAMBDA_MAX * min(1.0, step / max(warmup_steps, 1))
 
-        loss = loss_lm + lam * (loss_align + MU * loss_anchor)
+        loss = loss_lm + lam * loss_align + MU * loss_anchor
         loss.backward()
         optimizer.step()
 
@@ -507,13 +423,60 @@ def alignment_training(
                 n = (layers[m].mlp.c_fc.A.norm().item() +
                      layers[m].mlp.c_fc.B.norm().item())
                 lora_norms.append(round(n, 4))
+            rep_a_norm = (
+                rep_a_block.mlp.c_fc.conv.weight.norm().item() +
+                rep_a_block.mlp.c_proj.conv.weight.norm().item()
+            )
+            rep_b_norm = (
+                rep_b_block.mlp.c_fc.conv.weight.norm().item() +
+                rep_b_block.mlp.c_proj.conv.weight.norm().item()
+            )
             print(
                 f"  [align {step:4d}] "
                 f"LM={loss_lm.item():.4f}  "
                 f"Align={loss_align.item():.4f}  "
                 f"Anchor={loss_anchor.item():.4f}  "
+                f"Collapse={loss_align.item():.4f}  "
+                f"RepNorms=({rep_a_norm:.4f}, {rep_b_norm:.4f})  "
                 f"LoRA_norms={lora_norms}"
             )
+
+
+def collapse_pair_to_representative(
+    model,
+    registry: ClusterRegistry,
+    cid_a: int,
+    cid_b: int,
+) -> Tuple[int, int]:
+    """
+    Collapse two soft-aligned clusters into one shared base by choosing an
+    existing representative base and repointing every member to it.
+
+    Returns:
+        representative_cluster_id, representative_layer_idx
+    """
+    layers = model.transformer.h
+    ca = registry.clusters[cid_a]
+    cb = registry.clusters[cid_b]
+
+    if len(ca.members) >= len(cb.members):
+        rep_cluster_id = cid_a
+        rep_layer_idx = ca.shared_layer_idx
+    else:
+        rep_cluster_id = cid_b
+        rep_layer_idx = cb.shared_layer_idx
+
+    rep_block = layers[rep_layer_idx]
+    rep_fc_conv = rep_block.mlp.c_fc.conv
+    rep_proj_conv = rep_block.mlp.c_proj.conv
+
+    all_members = ca.members + cb.members
+    for m in all_members:
+        wrap_mlp_with_lora(layers[m])
+        layers[m].mlp.c_fc.conv = rep_fc_conv
+        layers[m].mlp.c_proj.conv = rep_proj_conv
+
+    return rep_cluster_id, rep_layer_idx
 
 
 # =============================================================================
@@ -641,12 +604,17 @@ def run_pipeline():
         pre_merge_state    = snapshot_model_state(model)
         pre_merge_registry = copy.deepcopy(registry)
 
+        rep_a_layer_idx = registry.clusters[cid_a].shared_layer_idx
+        rep_b_layer_idx = registry.clusters[cid_b].shared_layer_idx
+        all_members = registry.clusters[cid_a].members + registry.clusters[cid_b].members
+
         # ------------------------------------------------------------------ #
-        # PHASE 2 — Prepare merge (average bases, reset LoRAs)
+        # PHASE 2 — Soft alignment with two live representative bases
         # ------------------------------------------------------------------ #
-        print("\nPhase 2 — Preparing merge (averaging bases, resetting LoRAs) …")
-        shared_layer_idx = prepare_merge(model, registry, cid_a, cid_b)
-        print(f"  Shared base will live at layer {shared_layer_idx}")
+        print("\nPhase 2 — Soft alignment setup …")
+        print(f"  Representative A: layer {rep_a_layer_idx}")
+        print(f"  Representative B: layer {rep_b_layer_idx}")
+        print(f"  Active members   : {all_members}")
 
         # ------------------------------------------------------------------ #
         # PHASE 3 — Alignment training
@@ -655,7 +623,7 @@ def run_pipeline():
         alignment_training(
             model, dataset, tokenizer,
             registry, cid_a, cid_b,
-            frozen_originals, shared_layer_idx,
+            frozen_originals, rep_a_layer_idx, rep_b_layer_idx,
         )
 
         # ------------------------------------------------------------------ #
@@ -676,16 +644,23 @@ def run_pipeline():
                 "round": round_num,
                 "cid_a": cid_a, "cid_b": cid_b,
                 "dist": dist,
-                "delta_L": delta_align,
+                "delta_L_post_align": delta_align,
                 "accepted": False,
             })
             continue
 
         # ------------------------------------------------------------------ #
-        # PHASE 5 — Commit merge in registry
+        # PHASE 5 — Collapse to one representative base and commit merge
         # ------------------------------------------------------------------ #
+        print("\nPhase 5 — Collapsing to representative base …")
+        representative_cluster, representative_layer_idx = collapse_pair_to_representative(
+            model, registry, cid_a, cid_b
+        )
+        print(f"  Representative cluster: {representative_cluster}")
+        print(f"  Representative layer  : {representative_layer_idx}")
+
         print("\nPhase 5 — Committing merge …")
-        new_cid = registry.merge(cid_a, cid_b, shared_layer_idx)
+        new_cid = registry.merge(cid_a, cid_b, representative_layer_idx)
         print(f"  New cluster {new_cid}: {registry.clusters[new_cid].members}")
 
         # ------------------------------------------------------------------ #
@@ -711,6 +686,8 @@ def run_pipeline():
             "delta_L_final": delta_fin,
             "accepted": True,
             "grade": grade,
+            "representative_cluster": representative_cluster,
+            "representative_layer_idx": representative_layer_idx,
             "new_cluster": new_cid,
             "members": registry.clusters[new_cid].members,
         })
