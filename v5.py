@@ -17,14 +17,21 @@ from datasets import load_dataset
 import random
 import copy
 import json
+import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 # =============================================================================
 # CONFIG SMOKE RUN
 # =============================================================================
 DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_NAME     = "gpt2"
+TRAIN_DATASET_NAME = "wikitext-2 train"
+VALIDATION_DATASET_NAME = "wikitext-2 validation"
+TEST_DATASET_NAME = "wikitext-2 test"
+UPTRAIN_DATASET_NAME = "openwebtext train[:1%]"
 
 BATCH_SIZE     = 2        # tiny batch
 SEQ_LEN        = 32       # shorter sequences
@@ -35,7 +42,7 @@ RECOVERY_STEPS = 20       # quick stabilization
 
 LR_ALIGN       = 5e-5     # slightly higher → faster movement
 LR_RECOVERY    = 2e-5
-UPTRAIN_STEPS  = 50       # smoke-run final global uptraining
+UPTRAIN_STEPS  = 5       # smoke-run final global uptraining
 LR_UPTRAIN     = 1e-5
 KD_ALPHA       = 0.5
 UPTRAIN_LOG_INTERVAL = 10
@@ -46,11 +53,13 @@ MU             = 0.5      # lighter anchor
 LORA_RANK      = 1        # smaller → faster & less memory
 WARMUP_FRAC    = 0.2
 
-TARGET_CLUSTERS = 10      # only 1–2 merges (from 12 → 10)
+TARGET_CLUSTERS = 5      # only 1–2 merges (from 12 → 10)
 
 THRESH_EXCELLENT  = 0.2
 THRESH_ACCEPTABLE = 0.5
 THRESH_BAD        = 1.0   # very lenient → avoid rejection loops
+ALIGN_LOG_INTERVAL = 200
+RECOVERY_LOG_INTERVAL = 100
 
 # NUM_LAYERS = 12
 
@@ -107,6 +116,332 @@ def count_params_unique(model: nn.Module) -> int:
 
 def compression_ratio(unique_before: int, unique_after: int) -> float:
     return (1 - (unique_after / unique_before)) * 100
+
+
+def safe_percent_delta(current: float, baseline: float) -> float:
+    if baseline == 0:
+        return 0.0
+    return ((current - baseline) / baseline) * 100
+
+
+def sanitize_for_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_for_json(v) for v in value]
+    if isinstance(value, tuple):
+        return [sanitize_for_json(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+    return value
+
+
+class RunLogger:
+    def __init__(self, model_name: str, device: str):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = f"run_{timestamp}"
+        self.run_dir = Path("logs") / self.run_id
+        self.tables_dir = self.run_dir / "tables"
+        self.plots_dir = self.run_dir / "plots"
+        self.json_path = self.run_dir / "run.json"
+
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.tables_dir.mkdir(parents=True, exist_ok=True)
+        self.plots_dir.mkdir(parents=True, exist_ok=True)
+
+        self.data: Dict[str, Any] = {
+            "run_id": self.run_id,
+            "status": "running",
+            "last_completed_phase": "initializing",
+            "experiment": {
+                "model": model_name,
+                "device": device,
+                "timestamp": timestamp,
+                "datasets": {
+                    "train": TRAIN_DATASET_NAME,
+                    "validation": VALIDATION_DATASET_NAME,
+                    "test": TEST_DATASET_NAME,
+                    "uptraining": UPTRAIN_DATASET_NAME,
+                },
+                "hyperparameters": {
+                    "BATCH_SIZE": BATCH_SIZE,
+                    "SEQ_LEN": SEQ_LEN,
+                    "CALIB_BATCHES": CALIB_BATCHES,
+                    "ALIGN_STEPS": ALIGN_STEPS,
+                    "RECOVERY_STEPS": RECOVERY_STEPS,
+                    "LR_ALIGN": LR_ALIGN,
+                    "LR_RECOVERY": LR_RECOVERY,
+                    "UPTRAIN_STEPS": UPTRAIN_STEPS,
+                    "LR_UPTRAIN": LR_UPTRAIN,
+                    "KD_ALPHA": KD_ALPHA,
+                    "LAMBDA_MAX": LAMBDA_MAX,
+                    "MU": MU,
+                    "TARGET_CLUSTERS": TARGET_CLUSTERS,
+                    "LORA_RANK": LORA_RANK,
+                    "WARMUP_FRAC": WARMUP_FRAC,
+                    "THRESH_EXCELLENT": THRESH_EXCELLENT,
+                    "THRESH_ACCEPTABLE": THRESH_ACCEPTABLE,
+                    "THRESH_BAD": THRESH_BAD,
+                },
+                "logging": {
+                    "alignment_log_interval": ALIGN_LOG_INTERVAL,
+                    "recovery_log_interval": RECOVERY_LOG_INTERVAL,
+                    "uptraining_log_interval": UPTRAIN_LOG_INTERVAL,
+                },
+            },
+            "baseline": {},
+            "merge_history": [],
+            "phase_metrics": {
+                "alignment": [],
+                "recovery": [],
+                "uptraining": [],
+            },
+            "final": {},
+        }
+
+    def mark_phase(self, phase_name: str) -> None:
+        self.data["last_completed_phase"] = phase_name
+
+    def set_status(self, status: str, phase_name: str, error: Optional[str] = None) -> None:
+        self.data["status"] = status
+        self.data["last_completed_phase"] = phase_name
+        if error is None:
+            self.data.pop("error", None)
+        else:
+            self.data["error"] = error
+
+    def set_baseline(self, baseline: Dict[str, Any]) -> None:
+        self.data["baseline"] = sanitize_for_json(baseline)
+
+    def append_merge(self, merge_record: Dict[str, Any]) -> None:
+        self.data["merge_history"].append(sanitize_for_json(merge_record))
+
+    def append_phase_metric(self, phase_name: str, record: Dict[str, Any]) -> None:
+        self.data["phase_metrics"][phase_name].append(sanitize_for_json(record))
+
+    def set_final(self, final_section: Dict[str, Any]) -> None:
+        self.data["final"] = sanitize_for_json(final_section)
+
+    def write_json(self) -> None:
+        tmp_path = self.json_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(sanitize_for_json(self.data), indent=2), encoding="utf-8")
+        os.replace(tmp_path, self.json_path)
+
+    def write_checkpoint(self, phase_name: str, status: str = "running") -> None:
+        self.set_status(status, phase_name)
+        self.write_json()
+
+    def finalize(self, status: str = "completed", phase_name: str = "complete") -> None:
+        error = self.data.get("error") if status == "failed" else None
+        self.set_status(status, phase_name, error=error)
+        self.write_json()
+        self.write_tables()
+        self.write_plots()
+
+    def _write_markdown_table(self, path: Path, headers: List[str], rows: List[List[Any]]) -> None:
+        lines = [
+            "| " + " | ".join(headers) + " |",
+            "| " + " | ".join(["---"] * len(headers)) + " |",
+        ]
+        for row in rows:
+            formatted = []
+            for value in row:
+                if isinstance(value, float):
+                    formatted.append(f"{value:.4f}")
+                else:
+                    formatted.append(str(value))
+            lines.append("| " + " | ".join(formatted) + " |")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def write_tables(self) -> None:
+        baseline = self.data.get("baseline", {})
+        final = self.data.get("final", {})
+        final_metrics = final.get("metrics", {})
+        final_compression = final.get("compression", {})
+
+        summary_rows = [
+            ["Baseline", baseline.get("L_orig", ""), baseline.get("PPL_validation", ""), baseline.get("PPL_test", ""), baseline.get("params_unique", "")],
+            ["Final", final_metrics.get("L_final", ""), final_metrics.get("PPL_validation", ""), final_metrics.get("PPL_test", ""), final_compression.get("params_after", "")],
+        ]
+        self._write_markdown_table(
+            self.tables_dir / "baseline_final_summary.md",
+            ["Stage", "Loss", "Validation PPL", "Test PPL", "Unique Params"],
+            summary_rows,
+        )
+
+        merge_rows = []
+        for entry in self.data.get("merge_history", []):
+            merge_rows.append([
+                entry.get("round", ""),
+                entry.get("accepted", ""),
+                entry.get("clusters_before", ""),
+                entry.get("merge_pair", ""),
+                entry.get("distance", ""),
+                entry.get("L_post_align", ""),
+                entry.get("PPL_post_align", ""),
+                entry.get("L_final", ""),
+                entry.get("compression_after", ""),
+            ])
+        self._write_markdown_table(
+            self.tables_dir / "merge_history.md",
+            ["Round", "Accepted", "Clusters Before", "Merge Pair", "Distance", "L Post Align", "PPL Post Align", "L Final", "Compression %"],
+            merge_rows,
+        )
+
+        compression_rows = [[
+            final_compression.get("params_before", ""),
+            final_compression.get("params_after", ""),
+            final_compression.get("compression_percent", ""),
+        ]]
+        self._write_markdown_table(
+            self.tables_dir / "compression_summary.md",
+            ["Params Before", "Params After", "Compression %"],
+            compression_rows,
+        )
+
+    def _write_svg_line_plot(
+        self,
+        path: Path,
+        title: str,
+        x_label: str,
+        y_label: str,
+        series: List[Tuple[str, List[Tuple[float, float]]]],
+    ) -> None:
+        width = 900
+        height = 520
+        left = 80
+        right = 40
+        top = 60
+        bottom = 70
+        plot_width = width - left - right
+        plot_height = height - top - bottom
+        colors = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b"]
+
+        all_points = [point for _, points in series for point in points]
+        if not all_points:
+            svg = (
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+                f'<text x="{width/2}" y="{height/2}" text-anchor="middle" font-size="24">{title}: no data</text>'
+                "</svg>"
+            )
+            path.write_text(svg, encoding="utf-8")
+            return
+
+        xs = [p[0] for p in all_points]
+        ys = [p[1] for p in all_points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        if min_x == max_x:
+            max_x = min_x + 1.0
+        if min_y == max_y:
+            max_y = min_y + 1.0
+
+        def sx(x: float) -> float:
+            return left + ((x - min_x) / (max_x - min_x)) * plot_width
+
+        def sy(y: float) -> float:
+            return top + plot_height - ((y - min_y) / (max_y - min_y)) * plot_height
+
+        parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
+            f'<rect width="{width}" height="{height}" fill="white"/>',
+            f'<text x="{width/2}" y="30" text-anchor="middle" font-size="24" font-family="Arial">{title}</text>',
+            f'<line x1="{left}" y1="{top+plot_height}" x2="{left+plot_width}" y2="{top+plot_height}" stroke="#333" stroke-width="2"/>',
+            f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top+plot_height}" stroke="#333" stroke-width="2"/>',
+            f'<text x="{width/2}" y="{height-20}" text-anchor="middle" font-size="16" font-family="Arial">{x_label}</text>',
+            f'<text x="20" y="{height/2}" text-anchor="middle" font-size="16" font-family="Arial" transform="rotate(-90 20 {height/2})">{y_label}</text>',
+        ]
+
+        for idx in range(5):
+            frac = idx / 4
+            gx = left + frac * plot_width
+            gy = top + frac * plot_height
+            x_value = min_x + frac * (max_x - min_x)
+            y_value = max_y - frac * (max_y - min_y)
+            parts.append(f'<line x1="{gx}" y1="{top}" x2="{gx}" y2="{top+plot_height}" stroke="#ddd" stroke-width="1"/>')
+            parts.append(f'<line x1="{left}" y1="{gy}" x2="{left+plot_width}" y2="{gy}" stroke="#ddd" stroke-width="1"/>')
+            parts.append(f'<text x="{gx}" y="{top+plot_height+20}" text-anchor="middle" font-size="12" font-family="Arial">{x_value:.1f}</text>')
+            parts.append(f'<text x="{left-10}" y="{gy+4}" text-anchor="end" font-size="12" font-family="Arial">{y_value:.2f}</text>')
+
+        legend_y = top
+        for idx, (label, points) in enumerate(series):
+            if not points:
+                continue
+            color = colors[idx % len(colors)]
+            polyline = " ".join(f"{sx(x):.2f},{sy(y):.2f}" for x, y in points)
+            parts.append(f'<polyline fill="none" stroke="{color}" stroke-width="2.5" points="{polyline}"/>')
+            for x, y in points:
+                parts.append(f'<circle cx="{sx(x):.2f}" cy="{sy(y):.2f}" r="3" fill="{color}"/>')
+            legend_x = left + plot_width + 10
+            parts.append(f'<rect x="{legend_x}" y="{legend_y}" width="12" height="12" fill="{color}"/>')
+            parts.append(f'<text x="{legend_x + 18}" y="{legend_y + 10}" font-size="12" font-family="Arial">{label}</text>')
+            legend_y += 20
+
+        parts.append("</svg>")
+        path.write_text("\n".join(parts), encoding="utf-8")
+
+    def write_plots(self) -> None:
+        align_series: Dict[int, List[Tuple[float, float]]] = {}
+        for record in self.data["phase_metrics"].get("alignment", []):
+            align_series.setdefault(record["round"], []).append((record["step"], record["total_loss"]))
+        self._write_svg_line_plot(
+            self.plots_dir / "alignment_loss_by_round.svg",
+            "Alignment Loss by Round",
+            "Step",
+            "Total Loss",
+            [(f"Round {round_id}", points) for round_id, points in sorted(align_series.items())],
+        )
+
+        recovery_series: Dict[int, List[Tuple[float, float]]] = {}
+        for record in self.data["phase_metrics"].get("recovery", []):
+            recovery_series.setdefault(record["round"], []).append((record["step"], record["train_loss"]))
+        self._write_svg_line_plot(
+            self.plots_dir / "recovery_loss_by_round.svg",
+            "Recovery Loss by Round",
+            "Step",
+            "Train Loss",
+            [(f"Round {round_id}", points) for round_id, points in sorted(recovery_series.items())],
+        )
+
+        uptraining = self.data["phase_metrics"].get("uptraining", [])
+        self._write_svg_line_plot(
+            self.plots_dir / "uptraining_losses.svg",
+            "Uptraining Loss Curves",
+            "Step",
+            "Loss",
+            [
+                ("LM Loss", [(r["step"], r["lm_loss"]) for r in uptraining]),
+                ("KD Loss", [(r["step"], r["kd_loss"]) for r in uptraining]),
+                ("Total Loss", [(r["step"], r["total_loss"]) for r in uptraining]),
+            ],
+        )
+        self._write_svg_line_plot(
+            self.plots_dir / "uptraining_validation_ppl.svg",
+            "Uptraining Validation PPL",
+            "Step",
+            "Validation PPL",
+            [("Validation PPL", [(r["step"], r["val_ppl"]) for r in uptraining if "val_ppl" in r])],
+        )
+
+        accepted_merges = [m for m in self.data.get("merge_history", []) if m.get("accepted")]
+        self._write_svg_line_plot(
+            self.plots_dir / "compression_vs_merge.svg",
+            "Compression vs Accepted Merge",
+            "Accepted Merge Index",
+            "Compression %",
+            [("Compression", [(idx + 1, m["compression_after"]) for idx, m in enumerate(accepted_merges) if "compression_after" in m])],
+        )
+        self._write_svg_line_plot(
+            self.plots_dir / "validation_ppl_vs_merge.svg",
+            "Validation PPL vs Accepted Merge",
+            "Accepted Merge Index",
+            "Validation PPL",
+            [("Validation PPL", [(idx + 1, m["PPL_final"]) for idx, m in enumerate(accepted_merges) if "PPL_final" in m])],
+        )
 
 # =============================================================================
 # LORA
@@ -262,6 +597,7 @@ def get_batch(dataset, tokenizer) -> Tuple[torch.Tensor, torch.Tensor]:
 # =============================================================================
 
 def compute_perplexity(model, dataset, tokenizer, max_length=1024, stride=512):
+    was_training = model.training
     model.eval()
 
     # Use a FIXED evaluation set (important)
@@ -297,9 +633,12 @@ def compute_perplexity(model, dataset, tokenizer, max_length=1024, stride=512):
             break
 
     ppl = torch.exp(torch.tensor(total_nll / total_tokens)).item()
+    if was_training:
+        model.train()
     return ppl
 
 def evaluate(model, dataset, tokenizer, num_batches: int = 30) -> float:
+    was_training = model.training
     model.eval()
     losses = []
     with torch.no_grad():
@@ -307,7 +646,8 @@ def evaluate(model, dataset, tokenizer, num_batches: int = 30) -> float:
             x, m = get_batch(dataset, tokenizer)
             loss = model(x, attention_mask=m, labels=x).loss
             losses.append(loss.item())
-    model.train()
+    if was_training:
+        model.train()
     return sum(losses) / len(losses)
 
 def build_eval_dataset():
@@ -503,6 +843,8 @@ def alignment_training(
     frozen_originals: Dict[int, nn.Module],
     rep_a_layer_idx: int,
     rep_b_layer_idx: int,
+    round_num: int,
+    logger: Optional[RunLogger] = None,
     steps: int = ALIGN_STEPS,
 ) -> None:
     """
@@ -583,7 +925,18 @@ def alignment_training(
         loss.backward()
         optimizer.step()
 
-        if step % 200 == 0:
+        should_log = step % ALIGN_LOG_INTERVAL == 0 or step == steps - 1
+        if should_log:
+            if logger is not None:
+                logger.append_phase_metric("alignment", {
+                    "round": round_num,
+                    "step": step,
+                    "lm_loss": loss_lm.item(),
+                    "align_loss": loss_align.item(),
+                    "anchor_loss": loss_anchor.item(),
+                    "total_loss": loss.item(),
+                    "lambda": lam,
+                })
             lora_norms = []
             for m in all_members:
                 n = (layers[m].mlp.c_fc.A.norm().item() +
@@ -652,6 +1005,8 @@ def recovery_finetune(
     model,
     dataset,
     tokenizer,
+    round_num: int,
+    logger: Optional[RunLogger] = None,
     steps: int = RECOVERY_STEPS,
 ) -> None:
     """Short LM-only fine-tuning pass to let the whole model settle."""
@@ -666,7 +1021,14 @@ def recovery_finetune(
         loss.backward()
         optimizer.step()
 
-        if step % 100 == 0:
+        should_log = step % RECOVERY_LOG_INTERVAL == 0 or step == steps - 1
+        if should_log:
+            if logger is not None:
+                logger.append_phase_metric("recovery", {
+                    "round": round_num,
+                    "step": step,
+                    "train_loss": loss.item(),
+                })
             print(f"  [recovery {step:3d}] LM={loss.item():.4f}")
 
 
@@ -674,8 +1036,10 @@ def uptraining_phase(
     model,
     teacher,
     dataset,
+    eval_dataset,
     tokenizer,
     registry: ClusterRegistry,
+    logger: Optional[RunLogger] = None,
     steps: int = UPTRAIN_STEPS,
 ) -> None:
     """
@@ -718,11 +1082,21 @@ def uptraining_phase(
 
         if step % UPTRAIN_LOG_INTERVAL == 0 or step == steps - 1:
             assert_shared_ffn_ties(model, registry)
+            val_ppl = compute_perplexity(model, eval_dataset, tokenizer)
+            if logger is not None:
+                logger.append_phase_metric("uptraining", {
+                    "step": step,
+                    "lm_loss": loss_lm.item(),
+                    "kd_loss": loss_kd.item(),
+                    "total_loss": loss.item(),
+                    "val_ppl": val_ppl,
+                })
             print(
                 f"  [uptrain {step:4d}] "
                 f"LM={loss_lm.item():.4f}  "
                 f"KD={loss_kd.item():.4f}  "
-                f"Total={loss.item():.4f}"
+                f"Total={loss.item():.4f}  "
+                f"ValPPL={val_ppl:.2f}"
             )
 
     assert_shared_ffn_ties(model, registry)
@@ -786,8 +1160,10 @@ def phase0_setup():
     test_dataset = build_test_dataset()
 
     PPL_base = compute_perplexity(model, eval_dataset, tokenizer)
+    PPL_base_test = compute_perplexity(model, test_dataset, tokenizer)
 
     print(f"  Baseline PPL (correct) = {PPL_base:.2f}")
+    print(f"  Baseline Test PPL      = {PPL_base_test:.2f}")
     
     registry = ClusterRegistry(NUM_LAYERS)
     print("  Initial clusters:")
@@ -795,251 +1171,330 @@ def phase0_setup():
 
     # return model, tokenizer, dataset, frozen_originals, registry, L_orig
     # return model, tokenizer, dataset, eval_dataset, frozen_originals, registry, L_orig, PPL_base, before_unique
-    return model, tokenizer, dataset, eval_dataset, test_dataset, frozen_originals, registry, L_orig, PPL_base, before_unique
+    return (
+        model,
+        tokenizer,
+        dataset,
+        eval_dataset,
+        test_dataset,
+        frozen_originals,
+        registry,
+        L_orig,
+        PPL_base,
+        PPL_base_test,
+        before_total,
+        before_unique,
+    )
 
 # =============================================================================
 # MAIN PIPELINE LOOP
 # =============================================================================
 def run_pipeline():
-    # model, tokenizer, dataset, frozen_originals, registry, L_orig = phase0_setup()
-    model, tokenizer, dataset, eval_dataset, test_dataset, frozen_originals, registry, L_orig, PPL_base, before_unique = phase0_setup()
+    logger = RunLogger(MODEL_NAME, DEVICE)
+    merge_history = []
 
-    merge_history = []  # list of dicts for bookkeeping
+    try:
+        (
+            model,
+            tokenizer,
+            dataset,
+            eval_dataset,
+            test_dataset,
+            frozen_originals,
+            registry,
+            L_orig,
+            PPL_base,
+            PPL_base_test,
+            before_total,
+            before_unique,
+        ) = phase0_setup()
 
-    round_num = 0
+        logger.set_baseline({
+            "L_orig": L_orig,
+            "PPL_validation": PPL_base,
+            "PPL_test": PPL_base_test,
+            "params_total": before_total,
+            "params_unique": before_unique,
+            "initial_clusters": registry.num_clusters(),
+        })
+        logger.write_checkpoint("phase0_baseline")
 
-    while registry.num_clusters() > TARGET_CLUSTERS:
-        round_num += 1
-        print(f"\n{'='*60}")
-        print(f"MERGE ROUND {round_num}  |  clusters={registry.num_clusters()}")
-        print(f"{'='*60}")
+        round_num = 0
 
-        # ------------------------------------------------------------------ #
-        # PHASE 1 — Build distance matrix
-        # ------------------------------------------------------------------ #
-        print("Phase 1 — Caching activations …")
-        act_cache = cache_activations(model, dataset, tokenizer)
+        while registry.num_clusters() > TARGET_CLUSTERS:
+            round_num += 1
+            clusters_before = registry.num_clusters()
+            print(f"\n{'='*60}")
+            print(f"MERGE ROUND {round_num}  |  clusters={clusters_before}")
+            print(f"{'='*60}")
 
-        print("Phase 1 — Building distance matrix …")
-        dist_mat  = build_distance_matrix(model, registry, act_cache)
+            print("Phase 1 — Caching activations …")
+            act_cache = cache_activations(model, dataset, tokenizer)
 
-        # Pretty-print a few distances
-        sorted_pairs = sorted(dist_mat.items(), key=lambda kv: kv[1])
-        print("  Top-5 closest pairs:")
-        for (ca, cb), d in sorted_pairs[:5]:
-            print(f"    clusters ({ca},{cb})  D={d:.6f}")
+            print("Phase 1 — Building distance matrix …")
+            dist_mat = build_distance_matrix(model, registry, act_cache)
+            logger.mark_phase(f"round_{round_num}_distance_matrix")
+            logger.write_json()
 
-        candidate = pick_merge_candidate(dist_mat, registry)
-        if candidate is None:
-            print("  No valid merge candidates remain. Stopping.")
-            break
+            sorted_pairs = sorted(dist_mat.items(), key=lambda kv: kv[1])
+            print("  Top-5 closest pairs:")
+            for (ca, cb), d in sorted_pairs[:5]:
+                print(f"    clusters ({ca},{cb})  D={d:.6f}")
 
-        cid_a, cid_b, dist = candidate
-        print(f"\n  → Selected: cluster {cid_a} ∪ cluster {cid_b}  (D={dist:.6f})")
-        print(f"    Members A={registry.clusters[cid_a].members}  "
-              f"Members B={registry.clusters[cid_b].members}")
+            candidate = pick_merge_candidate(dist_mat, registry)
+            if candidate is None:
+                print("  No valid merge candidates remain. Stopping.")
+                logger.mark_phase("no_valid_merge_candidates")
+                logger.write_json()
+                break
 
-        # ------------------------------------------------------------------ #
-        # Snapshot for rollback
-        # ------------------------------------------------------------------ #
-        pre_merge_state    = snapshot_model_state(model)
-        pre_merge_registry = copy.deepcopy(registry)
+            cid_a, cid_b, dist = candidate
+            members_a = list(registry.clusters[cid_a].members)
+            members_b = list(registry.clusters[cid_b].members)
+            print(f"\n  → Selected: cluster {cid_a} ∪ cluster {cid_b}  (D={dist:.6f})")
+            print(f"    Members A={members_a}  Members B={members_b}")
 
-        rep_a_layer_idx = registry.clusters[cid_a].shared_layer_idx
-        rep_b_layer_idx = registry.clusters[cid_b].shared_layer_idx
-        all_members = registry.clusters[cid_a].members + registry.clusters[cid_b].members
+            pre_merge_state = snapshot_model_state(model)
+            pre_merge_registry = copy.deepcopy(registry)
 
-        # ------------------------------------------------------------------ #
-        # PHASE 2 — Soft alignment with two live representative bases
-        # ------------------------------------------------------------------ #
-        print("\nPhase 2 — Soft alignment setup …")
-        print(f"  Representative A: layer {rep_a_layer_idx}")
-        print(f"  Representative B: layer {rep_b_layer_idx}")
-        print(f"  Active members   : {all_members}")
+            rep_a_layer_idx = registry.clusters[cid_a].shared_layer_idx
+            rep_b_layer_idx = registry.clusters[cid_b].shared_layer_idx
+            all_members = members_a + members_b
 
-        # ------------------------------------------------------------------ #
-        # PHASE 3 — Alignment training
-        # ------------------------------------------------------------------ #
-        print(f"\nPhase 3 — Alignment training ({ALIGN_STEPS} steps) …")
-        alignment_training(
-            model, dataset, tokenizer,
-            registry, cid_a, cid_b,
-            frozen_originals, rep_a_layer_idx, rep_b_layer_idx,
-        )
+            print("\nPhase 2 — Soft alignment setup …")
+            print(f"  Representative A: layer {rep_a_layer_idx}")
+            print(f"  Representative B: layer {rep_b_layer_idx}")
+            print(f"  Active members   : {all_members}")
 
-        # ------------------------------------------------------------------ #
-        # PHASE 4 — Evaluate before committing
-        # ------------------------------------------------------------------ #
-        print("\nPhase 4 — Evaluating post-alignment …")
-        L_post_align = evaluate(model, dataset, tokenizer)
-        delta_align  = L_post_align - L_orig
-        print(f"  L_post_align={L_post_align:.4f}  ΔL={delta_align:+.4f}")
+            print(f"\nPhase 3 — Alignment training ({ALIGN_STEPS} steps) …")
+            alignment_training(
+                model, dataset, tokenizer,
+                registry, cid_a, cid_b,
+                frozen_originals, rep_a_layer_idx, rep_b_layer_idx,
+                round_num=round_num,
+                logger=logger,
+            )
+            logger.write_checkpoint(f"round_{round_num}_alignment")
 
-        PPL_post_align = compute_perplexity(model, eval_dataset, tokenizer)
-        delta_ppl = PPL_post_align - PPL_base
-        rel = (delta_ppl / PPL_base) * 100
+            print("\nPhase 4 — Evaluating post-alignment …")
+            L_post_align = evaluate(model, dataset, tokenizer)
+            delta_align = L_post_align - L_orig
+            print(f"  L_post_align={L_post_align:.4f}  ΔL={delta_align:+.4f}")
 
-        print(f"  PPL_post_align={PPL_post_align:.2f}  ΔPPL={delta_ppl:+.2f}  %Δ={rel:+.2f}%")
-        
-        if delta_align > THRESH_BAD:
-            print(f"  ✗ ΔL={delta_align:.4f} > {THRESH_BAD} — REJECTING merge, rolling back.")
-            restore_model_state(model, pre_merge_state)
-            # Restore registry
-            registry = pre_merge_registry
-            registry.forbid_pair(cid_a, cid_b)
-            merge_history.append({
+            PPL_post_align = compute_perplexity(model, eval_dataset, tokenizer)
+            delta_ppl_align = PPL_post_align - PPL_base
+            rel_align = safe_percent_delta(PPL_post_align, PPL_base)
+            print(f"  PPL_post_align={PPL_post_align:.2f}  ΔPPL={delta_ppl_align:+.2f}  %Δ={rel_align:+.2f}%")
+
+            merge_record = {
                 "round": round_num,
-                "cid_a": cid_a, "cid_b": cid_b,
-                "dist": dist,
-                "delta_L_post_align": delta_align,
-                "accepted": False,
+                "clusters_before": clusters_before,
+                "merge_pair": [cid_a, cid_b],
+                "distance": dist,
+                "members_A": members_a,
+                "members_B": members_b,
+                "representative_candidates": {
+                    "layer_A": rep_a_layer_idx,
+                    "layer_B": rep_b_layer_idx,
+                },
+                "L_post_align": L_post_align,
+                "delta_L_align": delta_align,
+                "PPL_post_align": PPL_post_align,
+                "delta_PPL": delta_ppl_align,
+                "percent_delta_PPL": rel_align,
+            }
+
+            if delta_align > THRESH_BAD:
+                print(f"  ✗ ΔL={delta_align:.4f} > {THRESH_BAD} — REJECTING merge, rolling back.")
+                restore_model_state(model, pre_merge_state)
+                registry = pre_merge_registry
+                registry.forbid_pair(cid_a, cid_b)
+                merge_record.update({
+                    "accepted": False,
+                    "rejection_reason": f"delta_L_align > {THRESH_BAD}",
+                    "forbidden_pair_after_reject": [cid_a, cid_b],
+                })
+                merge_history.append(merge_record)
+                logger.append_merge(merge_record)
+                logger.write_checkpoint(f"round_{round_num}_rejected")
+                continue
+
+            print("\nPhase 5 — Collapsing to representative base …")
+            representative_cluster, representative_layer_idx = collapse_pair_to_representative(
+                model, registry, cid_a, cid_b
+            )
+            print(f"  Representative cluster: {representative_cluster}")
+            print(f"  Representative layer  : {representative_layer_idx}")
+
+            print("\nPhase 5 — Committing merge …")
+            new_cid = registry.merge(cid_a, cid_b, representative_layer_idx)
+            print(f"  New cluster {new_cid}: {registry.clusters[new_cid].members}")
+            assert_shared_ffn_ties(model, registry)
+            logger.write_checkpoint(f"round_{round_num}_merge_committed")
+
+            print(f"\nPhase 6 — Recovery fine-tuning ({RECOVERY_STEPS} steps) …")
+            recovery_finetune(model, dataset, tokenizer, round_num=round_num, logger=logger)
+            logger.write_checkpoint(f"round_{round_num}_recovery")
+
+            L_final = evaluate(model, dataset, tokenizer)
+            delta_fin = L_final - L_orig
+            PPL_final_round = compute_perplexity(model, eval_dataset, tokenizer)
+            delta_ppl_final = PPL_final_round - PPL_base
+            rel_final = safe_percent_delta(PPL_final_round, PPL_base)
+            print(f"\n  L_final={L_final:.4f}  ΔL={delta_fin:+.4f}")
+
+            grade = ("excellent" if delta_fin < THRESH_EXCELLENT
+                     else "acceptable" if delta_fin < THRESH_ACCEPTABLE
+                     else "borderline")
+            print(f"  Grade: {grade}")
+
+            print("\n  Current cluster state:")
+            print(registry.summary())
+
+            after_total = count_params_total(model)
+            after_unique = count_params_unique(model)
+            cr = compression_ratio(before_unique, after_unique)
+
+            print(f"  Params total  : {after_total:,}")
+            print(f"  Params unique : {after_unique:,}")
+            print(f"  Compression   : {cr:.2f}%")
+
+            merge_record.update({
+                "accepted": True,
+                "representative_cluster": representative_cluster,
+                "representative_layer": representative_layer_idx,
+                "new_cluster": new_cid,
+                "members": list(registry.clusters[new_cid].members),
+                "clusters_after": registry.num_clusters(),
+                "L_final": L_final,
+                "delta_L_final": delta_fin,
+                "PPL_final": PPL_final_round,
+                "delta_PPL_final": delta_ppl_final,
+                "percent_delta_PPL_final": rel_final,
+                "grade": grade,
+                "params_total_after": after_total,
+                "params_unique_after": after_unique,
+                "compression_after": cr,
             })
-            continue
 
-        # ------------------------------------------------------------------ #
-        # PHASE 5 — Collapse to one representative base and commit merge
-        # ------------------------------------------------------------------ #
-        print("\nPhase 5 — Collapsing to representative base …")
-        representative_cluster, representative_layer_idx = collapse_pair_to_representative(
-            model, registry, cid_a, cid_b
-        )
-        print(f"  Representative cluster: {representative_cluster}")
-        print(f"  Representative layer  : {representative_layer_idx}")
+            merge_history.append(merge_record)
+            logger.append_merge(merge_record)
+            logger.write_checkpoint(f"round_{round_num}_logged")
 
-        print("\nPhase 5 — Committing merge …")
-        new_cid = registry.merge(cid_a, cid_b, representative_layer_idx)
-        print(f"  New cluster {new_cid}: {registry.clusters[new_cid].members}")
+        print("\n" + "=" * 60)
+        print("PIPELINE COMPLETE")
+        print("=" * 60)
+        print(f"  Final cluster count : {registry.num_clusters()}")
+        print(f"  L_orig              : {L_orig:.4f}")
+        L_end = evaluate(model, dataset, tokenizer)
+        print(f"  L_final             : {L_end:.4f}")
+        print(f"  Total ΔL            : {L_end - L_orig:+.4f}")
+
+        PPL_final = compute_perplexity(model, eval_dataset, tokenizer)
+        delta_ppl = PPL_final - PPL_base
+        rel = safe_percent_delta(PPL_final, PPL_base)
+
+        print(f"  Final PPL           : {PPL_final:.2f}")
+        print(f"  Total ΔPPL          : {delta_ppl:+.2f}")
+        print(f"  Total %Δ            : {rel:+.2f}%")
+
+        final_unique = count_params_unique(model)
+        cr = compression_ratio(before_unique, final_unique)
+        print(f"\nFinal compression: {cr:.2f}%")
+
+        print("\nFinal cluster layout:")
+        print(registry.summary())
+        logger.write_checkpoint("pipeline_complete_pre_uptraining")
+
+        print("\n" + "=" * 60)
+        print("PHASE 7 — UPTRAINING")
+        print("=" * 60)
         assert_shared_ffn_ties(model, registry)
+        teacher = build_teacher_model()
+        uptraining_dataset = build_uptraining_dataset()
 
-        # ------------------------------------------------------------------ #
-        # PHASE 6 — Recovery fine-tuning
-        # ------------------------------------------------------------------ #
-        print(f"\nPhase 6 — Recovery fine-tuning ({RECOVERY_STEPS} steps) …")
-        recovery_finetune(model, dataset, tokenizer)
+        print(f"  Uptraining steps     : {UPTRAIN_STEPS}")
+        print(f"  Uptraining LR        : {LR_UPTRAIN}")
+        print(f"  KD alpha             : {KD_ALPHA}")
+        print(f"  Pre-uptraining loss  : {L_end:.4f}")
+        print(f"  Pre-uptraining PPL   : {PPL_final:.2f}")
 
-        L_final   = evaluate(model, dataset, tokenizer)
-        delta_fin = L_final - L_orig
-        print(f"\n  L_final={L_final:.4f}  ΔL={delta_fin:+.4f}")
+        uptraining_phase(
+            model,
+            teacher,
+            uptraining_dataset,
+            eval_dataset,
+            tokenizer,
+            registry,
+            logger=logger,
+        )
+        logger.write_checkpoint("phase7_uptraining")
 
-        grade = ("excellent" if delta_fin < THRESH_EXCELLENT
-                 else "acceptable" if delta_fin < THRESH_ACCEPTABLE
-                 else "borderline")
-        print(f"  Grade: {grade}")
+        assert_shared_ffn_ties(model, registry)
+        L_post_uptrain = evaluate(model, dataset, tokenizer)
+        PPL_post_uptrain = compute_perplexity(model, eval_dataset, tokenizer)
 
-        merge_history.append({
-            "round": round_num,
-            "cid_a": cid_a, "cid_b": cid_b,
-            "dist": dist,
-            "delta_L_post_align": delta_align,
-            "delta_L_final": delta_fin,
-            "accepted": True,
-            "grade": grade,
-            "representative_cluster": representative_cluster,
-            "representative_layer_idx": representative_layer_idx,
-            "new_cluster": new_cid,
-            "members": registry.clusters[new_cid].members,
+        print("\nPost-uptraining summary:")
+        print(f"  L_post_uptrain       : {L_post_uptrain:.4f}")
+        print(f"  ΔL vs baseline       : {L_post_uptrain - L_orig:+.4f}")
+        print(f"  ΔL vs pre-uptraining : {L_post_uptrain - L_end:+.4f}")
+        print(f"  PPL_post_uptrain     : {PPL_post_uptrain:.2f}")
+        print(f"  ΔPPL vs baseline     : {PPL_post_uptrain - PPL_base:+.2f}")
+        print(f"  ΔPPL vs pre-uptrain  : {PPL_post_uptrain - PPL_final:+.2f}")
+
+        print("\n" + "=" * 60)
+        print("FINAL TEST SET EVALUATION")
+        print("=" * 60)
+
+        PPL_test = compute_perplexity(model, test_dataset, tokenizer)
+        delta_ppl_test = PPL_test - PPL_base_test
+        percent_delta_ppl_test = safe_percent_delta(PPL_test, PPL_base_test)
+        final_total = count_params_total(model)
+        final_unique = count_params_unique(model)
+        final_compression = compression_ratio(before_unique, final_unique)
+
+        print(f"  Test PPL (final)     : {PPL_test:.2f}")
+        print(f"  Test PPL (baseline)  : {PPL_base_test:.2f}")
+        print(f"  Test ΔPPL            : {delta_ppl_test:+.2f}")
+        print(f"  Test %Δ              : {percent_delta_ppl_test:+.2f}%")
+
+        logger.set_final({
+            "clusters": registry.num_clusters(),
+            "total_merges": sum(1 for entry in merge_history if entry.get("accepted")),
+            "metrics": {
+                "L_final": L_post_uptrain,
+                "PPL_validation": PPL_post_uptrain,
+                "PPL_test": PPL_test,
+                "delta_PPL_validation": PPL_post_uptrain - PPL_base,
+                "percent_delta_PPL_validation": safe_percent_delta(PPL_post_uptrain, PPL_base),
+                "delta_PPL_test": delta_ppl_test,
+                "percent_delta_PPL_test": percent_delta_ppl_test,
+            },
+            "compression": {
+                "params_before": before_unique,
+                "params_after": final_unique,
+                "params_total_before": before_total,
+                "params_total_after": final_total,
+                "compression_percent": final_compression,
+            },
+            "cluster_layout": registry.summary(),
         })
 
-        print("\n  Current cluster state:")
-        print(registry.summary())
-        
-        after_total  = count_params_total(model)
-        after_unique = count_params_unique(model)
+        print("\nMerge history:")
+        for entry in merge_history:
+            print(" ", json.dumps(entry, indent=2))
 
-        cr = compression_ratio(before_unique, after_unique)
-
-        print(f"  Params total  : {after_total:,}")
-        print(f"  Params unique : {after_unique:,}")
-        print(f"  Compression   : {cr:.2f}%")
-
-    # ------------------------------------------------------------------ #
-    # DONE
-    # ------------------------------------------------------------------ #
-    print("\n" + "=" * 60)
-    print("PIPELINE COMPLETE")
-    print("=" * 60)
-    print(f"  Final cluster count : {registry.num_clusters()}")
-    print(f"  L_orig              : {L_orig:.4f}")
-    L_end = evaluate(model, dataset, tokenizer)
-    print(f"  L_final             : {L_end:.4f}")
-    print(f"  Total ΔL            : {L_end - L_orig:+.4f}")
-    
-    PPL_final = compute_perplexity(model, eval_dataset, tokenizer)
-
-    delta_ppl = PPL_final - PPL_base
-    rel = (delta_ppl / PPL_base) * 100
-
-    print(f"  Final PPL           : {PPL_final:.2f}")
-    print(f"  Total ΔPPL          : {delta_ppl:+.2f}")
-    print(f"  Total %Δ            : {rel:+.2f}%")
-    
-    final_unique = count_params_unique(model)
-    cr = compression_ratio(before_unique, final_unique)
-
-    print(f"\nFinal compression: {cr:.2f}%")
-    
-    print("\nFinal cluster layout:")
-    print(registry.summary())
-
-    print("\n" + "=" * 60)
-    print("PHASE 7 — UPTRAINING")
-    print("=" * 60)
-    assert_shared_ffn_ties(model, registry)
-    teacher = build_teacher_model()
-    uptraining_dataset = build_uptraining_dataset()
-
-    print(f"  Uptraining steps     : {UPTRAIN_STEPS}")
-    print(f"  Uptraining LR        : {LR_UPTRAIN}")
-    print(f"  KD alpha             : {KD_ALPHA}")
-    print(f"  Pre-uptraining loss  : {L_end:.4f}")
-    print(f"  Pre-uptraining PPL   : {PPL_final:.2f}")
-
-    uptraining_phase(
-        model,
-        teacher,
-        uptraining_dataset,
-        tokenizer,
-        registry,
-    )
-
-    assert_shared_ffn_ties(model, registry)
-    L_post_uptrain = evaluate(model, dataset, tokenizer)
-    PPL_post_uptrain = compute_perplexity(model, eval_dataset, tokenizer)
-
-    print("\nPost-uptraining summary:")
-    print(f"  L_post_uptrain       : {L_post_uptrain:.4f}")
-    print(f"  ΔL vs baseline       : {L_post_uptrain - L_orig:+.4f}")
-    print(f"  ΔL vs pre-uptraining : {L_post_uptrain - L_end:+.4f}")
-    print(f"  PPL_post_uptrain     : {PPL_post_uptrain:.2f}")
-    print(f"  ΔPPL vs baseline     : {PPL_post_uptrain - PPL_base:+.2f}")
-    print(f"  ΔPPL vs pre-uptrain  : {PPL_post_uptrain - PPL_final:+.2f}")
-
-
-    print("\n" + "=" * 60)
-    print("FINAL TEST SET EVALUATION")
-    print("=" * 60)
-
-    # --- baseline on test set (important for fair comparison)
-    baseline_model = GPT2LMHeadModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
-    PPL_base_test = compute_perplexity(baseline_model, test_dataset, tokenizer)
-
-    # --- final model PPL on test set
-    PPL_test = compute_perplexity(model, test_dataset, tokenizer)
-
-    print(f"  Test PPL (final)     : {PPL_test:.2f}")
-    print(f"  Test PPL (baseline)  : {PPL_base_test:.2f}")
-    print(f"  Test ΔPPL            : {PPL_test - PPL_base_test:+.2f}")
-    print(f"  Test %Δ              : {((PPL_test - PPL_base_test)/PPL_base_test)*100:+.2f}%")
-
-    print("\nMerge history:")
-    for entry in merge_history:
-        print(" ", json.dumps(entry, indent=2))
-
-    return model, registry, merge_history
+        logger.finalize(status="completed", phase_name="complete")
+        return model, registry, merge_history, logger.json_path
+    except Exception as exc:
+        logger.set_status("failed", logger.data.get("last_completed_phase", "failed"), error=str(exc))
+        logger.finalize(status="failed", phase_name=logger.data.get("last_completed_phase", "failed"))
+        raise
 
 
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
 if __name__ == "__main__":
-    model, registry, history = run_pipeline()
+    model, registry, history, log_path = run_pipeline()
+    print(f"\nRun log saved to: {log_path}")
