@@ -9,6 +9,7 @@ Iteratively merges similar FFN layers by:
   5. Repeating until target cluster count is reached
 """
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,7 +19,7 @@ import random
 import copy
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -140,8 +141,15 @@ def sanitize_for_json(value: Any) -> Any:
     return value
 
 
+@dataclass(frozen=True)
+class PipelineConfig:
+    model_name: str = MODEL_NAME
+    target_clusters: int = TARGET_CLUSTERS
+    rank: int = LORA_RANK
+
+
 class RunLogger:
-    def __init__(self, model_name: str, device: str):
+    def __init__(self, config: PipelineConfig, device: str):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_id = f"run_{timestamp}"
         self.run_dir = Path("logs") / self.run_id
@@ -158,9 +166,10 @@ class RunLogger:
             "status": "running",
             "last_completed_phase": "initializing",
             "experiment": {
-                "model": model_name,
+                "model": config.model_name,
                 "device": device,
                 "timestamp": timestamp,
+                "runtime_inputs": asdict(config),
                 "datasets": {
                     "train": TRAIN_DATASET_NAME,
                     "validation": VALIDATION_DATASET_NAME,
@@ -180,8 +189,8 @@ class RunLogger:
                     "KD_ALPHA": KD_ALPHA,
                     "LAMBDA_MAX": LAMBDA_MAX,
                     "MU": MU,
-                    "TARGET_CLUSTERS": TARGET_CLUSTERS,
-                    "LORA_RANK": LORA_RANK,
+                    "TARGET_CLUSTERS": config.target_clusters,
+                    "LORA_RANK": config.rank,
                     "WARMUP_FRAC": WARMUP_FRAC,
                     "THRESH_EXCELLENT": THRESH_EXCELLENT,
                     "THRESH_ACCEPTABLE": THRESH_ACCEPTABLE,
@@ -465,7 +474,7 @@ class LoRAConv1D(nn.Module):
         return self.conv(x)
 
 
-def wrap_mlp_with_lora(block: nn.Module, rank: int = LORA_RANK) -> None:
+def wrap_mlp_with_lora(block: nn.Module, rank: int) -> None:
     """Replace c_fc and c_proj in an MLP block with LoRA-wrapped versions."""
     if not isinstance(block.mlp.c_fc, LoRAConv1D):
         block.mlp.c_fc   = LoRAConv1D(block.mlp.c_fc,   rank)
@@ -654,8 +663,8 @@ def build_eval_dataset():
     return load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
 
 
-def build_teacher_model() -> GPT2LMHeadModel:
-    teacher = GPT2LMHeadModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
+def build_teacher_model(model_name: str) -> GPT2LMHeadModel:
+    teacher = GPT2LMHeadModel.from_pretrained(model_name).to(DEVICE).eval()
     teacher.config.pad_token_id = teacher.config.eos_token_id
     for p in teacher.parameters():
         p.requires_grad = False
@@ -966,6 +975,7 @@ def collapse_pair_to_representative(
     registry: ClusterRegistry,
     cid_a: int,
     cid_b: int,
+    rank: int,
 ) -> Tuple[int, int]:
     """
     Collapse two soft-aligned clusters into one shared base by choosing an
@@ -991,7 +1001,7 @@ def collapse_pair_to_representative(
 
     all_members = ca.members + cb.members
     for m in all_members:
-        wrap_mlp_with_lora(layers[m])
+        wrap_mlp_with_lora(layers[m], rank=rank)
         layers[m].mlp.c_fc.conv = rep_fc_conv
         layers[m].mlp.c_proj.conv = rep_proj_conv
 
@@ -1117,16 +1127,16 @@ def restore_model_state(model, state: dict) -> None:
 # =============================================================================
 # PHASE 0 — INITIAL SETUP
 # =============================================================================
-def phase0_setup():
+def phase0_setup(model_name: str = MODEL_NAME, rank: int = LORA_RANK):
     
     print("=" * 60)
     print("PHASE 0 — Loading model and computing baseline")
     print("=" * 60)
 
-    tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
-    model = GPT2LMHeadModel.from_pretrained(MODEL_NAME).to(DEVICE)
+    model = GPT2LMHeadModel.from_pretrained(model_name).to(DEVICE)
     model.config.pad_token_id = tokenizer.pad_token_id
     model.train()
     NUM_LAYERS = len(model.transformer.h)
@@ -1141,7 +1151,7 @@ def phase0_setup():
 
     # Wrap every layer with LoRA from the start so forward_base always works
     for layer in model.transformer.h:
-        wrap_mlp_with_lora(layer)
+        wrap_mlp_with_lora(layer, rank=rank)
 
     # Frozen originals: deepcopy of each MLP *after* LoRA wrapping
     # but with zero LoRA (A small random, B zero) — effectively just the base.
@@ -1189,8 +1199,17 @@ def phase0_setup():
 # =============================================================================
 # MAIN PIPELINE LOOP
 # =============================================================================
-def run_pipeline():
-    logger = RunLogger(MODEL_NAME, DEVICE)
+def run_pipeline(
+    model_name: str = MODEL_NAME,
+    target_clusters: int = TARGET_CLUSTERS,
+    rank: int = LORA_RANK,
+):
+    config = PipelineConfig(
+        model_name=model_name,
+        target_clusters=target_clusters,
+        rank=rank,
+    )
+    logger = RunLogger(config, DEVICE)
     merge_history = []
 
     try:
@@ -1207,7 +1226,7 @@ def run_pipeline():
             PPL_base_test,
             before_total,
             before_unique,
-        ) = phase0_setup()
+        ) = phase0_setup(model_name=config.model_name, rank=config.rank)
 
         logger.set_baseline({
             "L_orig": L_orig,
@@ -1221,7 +1240,7 @@ def run_pipeline():
 
         round_num = 0
 
-        while registry.num_clusters() > TARGET_CLUSTERS:
+        while registry.num_clusters() > config.target_clusters:
             round_num += 1
             clusters_before = registry.num_clusters()
             print(f"\n{'='*60}")
@@ -1321,7 +1340,7 @@ def run_pipeline():
 
             print("\nPhase 5 — Collapsing to representative base …")
             representative_cluster, representative_layer_idx = collapse_pair_to_representative(
-                model, registry, cid_a, cid_b
+                model, registry, cid_a, cid_b, config.rank
             )
             print(f"  Representative cluster: {representative_cluster}")
             print(f"  Representative layer  : {representative_layer_idx}")
@@ -1410,7 +1429,7 @@ def run_pipeline():
         print("PHASE 7 — UPTRAINING")
         print("=" * 60)
         assert_shared_ffn_ties(model, registry)
-        teacher = build_teacher_model()
+        teacher = build_teacher_model(config.model_name)
         uptraining_dataset = build_uptraining_dataset()
 
         print(f"  Uptraining steps     : {UPTRAIN_STEPS}")
@@ -1492,9 +1511,46 @@ def run_pipeline():
         raise
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the FFN clustering and merging pipeline with configurable inputs.",
+    )
+    parser.add_argument(
+        "--model_name",
+        default=MODEL_NAME,
+        help="Hugging Face model name to load, e.g. gpt2 or gpt2-medium.",
+    )
+    parser.add_argument(
+        "--target_clusters",
+        type=int,
+        default=TARGET_CLUSTERS,
+        help="Desired number of clusters after merging.",
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=LORA_RANK,
+        help="LoRA rank used for parameter-efficient adaptation.",
+    )
+    return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.target_clusters <= 0:
+        raise ValueError("--target_clusters must be a positive integer.")
+    if args.rank <= 0:
+        raise ValueError("--rank must be a positive integer.")
+
+
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
 if __name__ == "__main__":
-    model, registry, history, log_path = run_pipeline()
+    args = parse_args()
+    validate_args(args)
+    model, registry, history, log_path = run_pipeline(
+        model_name=args.model_name,
+        target_clusters=args.target_clusters,
+        rank=args.rank,
+    )
     print(f"\nRun log saved to: {log_path}")
