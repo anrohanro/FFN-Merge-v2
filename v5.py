@@ -215,7 +215,10 @@ def export_final_artifacts(
     model_dir.mkdir(parents=True, exist_ok=True)
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
 
-    model.save_pretrained(model_dir)
+    # The compressed model intentionally reuses FFN parameters across layers.
+    # Hugging Face's safe serialization rejects this aliasing, so use the
+    # standard PyTorch format when exporting the shared-weight model.
+    model.save_pretrained(model_dir, safe_serialization=False)
     tokenizer.save_pretrained(tokenizer_dir)
 
     config_payload = {
