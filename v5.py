@@ -11,6 +11,7 @@ Iteratively merges similar FFN layers by:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from datasets import load_dataset
 import random
@@ -23,6 +24,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIG SMOKE RUN
 # =============================================================================
 DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME     = "gpt2"
 
 BATCH_SIZE     = 2        # tiny batch
 SEQ_LEN        = 32       # shorter sequences
@@ -33,6 +35,10 @@ RECOVERY_STEPS = 20       # quick stabilization
 
 LR_ALIGN       = 5e-5     # slightly higher → faster movement
 LR_RECOVERY    = 2e-5
+UPTRAIN_STEPS  = 50       # smoke-run final global uptraining
+LR_UPTRAIN     = 1e-5
+KD_ALPHA       = 0.5
+UPTRAIN_LOG_INTERVAL = 10
 
 LAMBDA_MAX     = 1.0      # weaker constraint (faster convergence)
 MU             = 0.5      # lighter anchor
@@ -60,6 +66,10 @@ THRESH_BAD        = 1.0   # very lenient → avoid rejection loops
 # RECOVERY_STEPS = 300      # LM-only fine-tuning after merge
 # LR_ALIGN       = 3e-5
 # LR_RECOVERY    = 1e-5
+# UPTRAIN_STEPS  = 2000
+# LR_UPTRAIN     = 1e-5
+# KD_ALPHA       = 0.5
+# UPTRAIN_LOG_INTERVAL = 100
 # LAMBDA_MAX     = 3.0      # weight on (align + anchor)
 # MU             = 1.0      # weight on anchor inside the structural term
 # LORA_RANK      = 8
@@ -224,6 +234,12 @@ def build_dataset():
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
     return ds
 
+def build_test_dataset():
+    return load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+
+def build_uptraining_dataset():
+    return load_dataset("openwebtext", split="train[:1%]")
+
 
 def get_batch(dataset, tokenizer) -> Tuple[torch.Tensor, torch.Tensor]:
     valid = []
@@ -296,6 +312,59 @@ def evaluate(model, dataset, tokenizer, num_batches: int = 30) -> float:
 
 def build_eval_dataset():
     return load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+
+
+def build_teacher_model() -> GPT2LMHeadModel:
+    teacher = GPT2LMHeadModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
+    teacher.config.pad_token_id = teacher.config.eos_token_id
+    for p in teacher.parameters():
+        p.requires_grad = False
+    return teacher
+
+
+def assert_shared_ffn_ties(model, registry: ClusterRegistry) -> None:
+    """
+    Ensure every merged cluster still shares the exact same Conv1D base modules.
+    This protects the compression invariant during later optimization phases.
+    """
+    layers = model.transformer.h
+
+    for cid, cluster in registry.clusters.items():
+        rep_idx = cluster.shared_layer_idx
+        rep_block = layers[rep_idx]
+        ref_fc = rep_block.mlp.c_fc.conv
+        ref_proj = rep_block.mlp.c_proj.conv
+
+        for member_idx in cluster.members:
+            block = layers[member_idx]
+            if block.mlp.c_fc.conv is not ref_fc:
+                raise RuntimeError(
+                    f"Shared FFN tie broken for cluster {cid}: "
+                    f"layer {member_idx} c_fc is not tied to representative layer {rep_idx}."
+                )
+            if block.mlp.c_proj.conv is not ref_proj:
+                raise RuntimeError(
+                    f"Shared FFN tie broken for cluster {cid}: "
+                    f"layer {member_idx} c_proj is not tied to representative layer {rep_idx}."
+                )
+
+
+def kd_kl_student_teacher(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    KL(p_student || p_teacher) over non-padded tokens.
+    """
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+    student_probs = student_log_probs.exp()
+
+    token_kl = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+    mask = attention_mask.to(token_kl.dtype)
+    denom = mask.sum().clamp_min(1.0)
+    return (token_kl * mask).sum() / denom
 # =============================================================================
 # PHASE 1 — DISTANCE MATRIX
 # =============================================================================
@@ -601,6 +670,64 @@ def recovery_finetune(
             print(f"  [recovery {step:3d}] LM={loss.item():.4f}")
 
 
+def uptraining_phase(
+    model,
+    teacher,
+    dataset,
+    tokenizer,
+    registry: ClusterRegistry,
+    steps: int = UPTRAIN_STEPS,
+) -> None:
+    """
+    Final global uptraining with LM loss + teacher-guided distillation.
+    All student parameters that require grad remain trainable.
+    Shared FFN references are audited throughout the phase.
+    """
+    model.train()
+    teacher.eval()
+    assert_shared_ffn_ties(model, registry)
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=LR_UPTRAIN)
+
+    for step in range(steps):
+        x, mask = get_batch(dataset, tokenizer)
+        optimizer.zero_grad()
+
+        student_outputs = model(
+            x,
+            attention_mask=mask,
+            labels=x,
+        )
+        loss_lm = student_outputs.loss
+
+        with torch.no_grad():
+            teacher_outputs = teacher(
+                x,
+                attention_mask=mask,
+            )
+
+        loss_kd = kd_kl_student_teacher(
+            student_outputs.logits,
+            teacher_outputs.logits,
+            mask,
+        )
+        loss = loss_lm + KD_ALPHA * loss_kd
+        loss.backward()
+        optimizer.step()
+
+        if step % UPTRAIN_LOG_INTERVAL == 0 or step == steps - 1:
+            assert_shared_ffn_ties(model, registry)
+            print(
+                f"  [uptrain {step:4d}] "
+                f"LM={loss_lm.item():.4f}  "
+                f"KD={loss_kd.item():.4f}  "
+                f"Total={loss.item():.4f}"
+            )
+
+    assert_shared_ffn_ties(model, registry)
+
+
 # =============================================================================
 # SNAPSHOT / RESTORE UTILITIES
 # =============================================================================
@@ -622,10 +749,10 @@ def phase0_setup():
     print("PHASE 0 — Loading model and computing baseline")
     print("=" * 60)
 
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME)
     tokenizer.pad_token = tokenizer.eos_token
 
-    model = GPT2LMHeadModel.from_pretrained("gpt2").to(DEVICE)
+    model = GPT2LMHeadModel.from_pretrained(MODEL_NAME).to(DEVICE)
     model.config.pad_token_id = tokenizer.pad_token_id
     model.train()
     NUM_LAYERS = len(model.transformer.h)
@@ -656,6 +783,7 @@ def phase0_setup():
     print(f"  Baseline L_orig = {L_orig:.4f}")
 
     eval_dataset = build_eval_dataset()
+    test_dataset = build_test_dataset()
 
     PPL_base = compute_perplexity(model, eval_dataset, tokenizer)
 
@@ -666,15 +794,15 @@ def phase0_setup():
     print(registry.summary())
 
     # return model, tokenizer, dataset, frozen_originals, registry, L_orig
-    return model, tokenizer, dataset, eval_dataset, frozen_originals, registry, L_orig, PPL_base, before_unique
-
+    # return model, tokenizer, dataset, eval_dataset, frozen_originals, registry, L_orig, PPL_base, before_unique
+    return model, tokenizer, dataset, eval_dataset, test_dataset, frozen_originals, registry, L_orig, PPL_base, before_unique
 
 # =============================================================================
 # MAIN PIPELINE LOOP
 # =============================================================================
 def run_pipeline():
     # model, tokenizer, dataset, frozen_originals, registry, L_orig = phase0_setup()
-    model, tokenizer, dataset, eval_dataset, frozen_originals, registry, L_orig, PPL_base, before_unique = phase0_setup()
+    model, tokenizer, dataset, eval_dataset, test_dataset, frozen_originals, registry, L_orig, PPL_base, before_unique = phase0_setup()
 
     merge_history = []  # list of dicts for bookkeeping
 
@@ -781,6 +909,7 @@ def run_pipeline():
         print("\nPhase 5 — Committing merge …")
         new_cid = registry.merge(cid_a, cid_b, representative_layer_idx)
         print(f"  New cluster {new_cid}: {registry.clusters[new_cid].members}")
+        assert_shared_ffn_ties(model, registry)
 
         # ------------------------------------------------------------------ #
         # PHASE 6 — Recovery fine-tuning
@@ -851,6 +980,56 @@ def run_pipeline():
     
     print("\nFinal cluster layout:")
     print(registry.summary())
+
+    print("\n" + "=" * 60)
+    print("PHASE 7 — UPTRAINING")
+    print("=" * 60)
+    assert_shared_ffn_ties(model, registry)
+    teacher = build_teacher_model()
+    uptraining_dataset = build_uptraining_dataset()
+
+    print(f"  Uptraining steps     : {UPTRAIN_STEPS}")
+    print(f"  Uptraining LR        : {LR_UPTRAIN}")
+    print(f"  KD alpha             : {KD_ALPHA}")
+    print(f"  Pre-uptraining loss  : {L_end:.4f}")
+    print(f"  Pre-uptraining PPL   : {PPL_final:.2f}")
+
+    uptraining_phase(
+        model,
+        teacher,
+        uptraining_dataset,
+        tokenizer,
+        registry,
+    )
+
+    assert_shared_ffn_ties(model, registry)
+    L_post_uptrain = evaluate(model, dataset, tokenizer)
+    PPL_post_uptrain = compute_perplexity(model, eval_dataset, tokenizer)
+
+    print("\nPost-uptraining summary:")
+    print(f"  L_post_uptrain       : {L_post_uptrain:.4f}")
+    print(f"  ΔL vs baseline       : {L_post_uptrain - L_orig:+.4f}")
+    print(f"  ΔL vs pre-uptraining : {L_post_uptrain - L_end:+.4f}")
+    print(f"  PPL_post_uptrain     : {PPL_post_uptrain:.2f}")
+    print(f"  ΔPPL vs baseline     : {PPL_post_uptrain - PPL_base:+.2f}")
+    print(f"  ΔPPL vs pre-uptrain  : {PPL_post_uptrain - PPL_final:+.2f}")
+
+
+    print("\n" + "=" * 60)
+    print("FINAL TEST SET EVALUATION")
+    print("=" * 60)
+
+    # --- baseline on test set (important for fair comparison)
+    baseline_model = GPT2LMHeadModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
+    PPL_base_test = compute_perplexity(baseline_model, test_dataset, tokenizer)
+
+    # --- final model PPL on test set
+    PPL_test = compute_perplexity(model, test_dataset, tokenizer)
+
+    print(f"  Test PPL (final)     : {PPL_test:.2f}")
+    print(f"  Test PPL (baseline)  : {PPL_base_test:.2f}")
+    print(f"  Test ΔPPL            : {PPL_test - PPL_base_test:+.2f}")
+    print(f"  Test %Δ              : {((PPL_test - PPL_base_test)/PPL_base_test)*100:+.2f}%")
 
     print("\nMerge history:")
     for entry in merge_history:
