@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from datasets import load_dataset
+from tqdm.auto import tqdm
 import random
 import copy
 import json
@@ -23,6 +24,49 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+# # =============================================================================
+# # CONFIG FINAL RUN
+# # =============================================================================
+# DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+# MODEL_NAME     = "gpt2"
+# TRAIN_DATASET_NAME = "wikitext-2 train"
+# VALIDATION_DATASET_NAME = "wikitext-2 validation"
+# TEST_DATASET_NAME = "wikitext-2 test"
+# UPTRAIN_DATASET_NAME = "openwebtext train[:10%]"
+
+# BATCH_SIZE     = 8        # tiny batch
+# SEQ_LEN        = 64       # shorter sequences
+# CALIB_BATCHES  = 3        # minimal for distance
+
+# ALIGN_STEPS    = 500       # just to check training loop
+# RECOVERY_STEPS = 200       # quick stabilization
+
+# LR_ALIGN       = 3e-5     # slightly higher → faster movement
+# LR_RECOVERY    = 1e-5
+# UPTRAIN_STEPS  = 1000       # smoke-run final global uptraining
+# LR_UPTRAIN     = 1e-5
+# KD_ALPHA       = 0.5
+# UPTRAIN_LOG_INTERVAL = 100
+
+# LAMBDA_MAX     = 1.0      # weaker constraint (faster convergence)
+# MU             = 0.5      # lighter anchor
+
+# LORA_RANK      = 1        # smaller → faster & less memory
+# WARMUP_FRAC    = 0.2
+
+# TARGET_CLUSTERS = 5      # only 1–2 merges (from 12 → 10)
+
+# THRESH_EXCELLENT  = 0.2
+# THRESH_ACCEPTABLE = 0.5
+# THRESH_BAD        = 1.0   # very lenient → avoid rejection loops
+# ALIGN_LOG_INTERVAL = 100
+# RECOVERY_LOG_INTERVAL = 50
+
+# # NUM_LAYERS = 12
+
+
 
 # =============================================================================
 # CONFIG SMOKE RUN
@@ -622,7 +666,11 @@ def compute_perplexity(model, dataset, tokenizer, max_length=1024, stride=512):
     total_tokens = 0
     prev_end = 0
 
-    for begin in range(0, seq_len, stride):
+    for begin in tqdm(
+        range(0, seq_len, stride),
+        desc="Perplexity",
+        leave=False,
+    ):
         end = min(begin + max_length, seq_len)
         target_len = end - prev_end
 
@@ -651,7 +699,11 @@ def evaluate(model, dataset, tokenizer, num_batches: int = 30) -> float:
     model.eval()
     losses = []
     with torch.no_grad():
-        for _ in range(num_batches):
+        for _ in tqdm(
+            range(num_batches),
+            desc="Evaluate",
+            leave=False,
+        ):
             x, m = get_batch(dataset, tokenizer)
             loss = model(x, attention_mask=m, labels=x).loss
             losses.append(loss.item())
@@ -745,7 +797,11 @@ def cache_activations(
         hooks.append(h)
 
     with torch.no_grad():
-        for _ in range(num_batches):
+        for _ in tqdm(
+            range(num_batches),
+            desc="Cache activations",
+            leave=False,
+        ):
             x, m = get_batch(dataset, tokenizer)
             model(x, attention_mask=m)
 
@@ -895,7 +951,11 @@ def alignment_training(
     optimizer = torch.optim.AdamW(params, lr=LR_ALIGN)
     warmup_steps = int(WARMUP_FRAC * steps)
 
-    for step in range(steps):
+    for step in tqdm(
+        range(steps),
+        desc=f"Align round {round_num}",
+        leave=False,
+    ):
         x, mask = get_batch(dataset, tokenizer)
         optimizer.zero_grad()
 
@@ -1024,7 +1084,11 @@ def recovery_finetune(
     params    = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=LR_RECOVERY)
 
-    for step in range(steps):
+    for step in tqdm(
+        range(steps),
+        desc=f"Recovery round {round_num}",
+        leave=False,
+    ):
         x, mask = get_batch(dataset, tokenizer)
         optimizer.zero_grad()
         loss = model(x, attention_mask=mask, labels=x).loss
@@ -1064,7 +1128,11 @@ def uptraining_phase(
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=LR_UPTRAIN)
 
-    for step in range(steps):
+    for step in tqdm(
+        range(steps),
+        desc="Uptraining",
+        leave=False,
+    ):
         x, mask = get_batch(dataset, tokenizer)
         optimizer.zero_grad()
 
@@ -1239,166 +1307,180 @@ def run_pipeline(
         logger.write_checkpoint("phase0_baseline")
 
         round_num = 0
+        merge_rounds_total = max(registry.num_clusters() - config.target_clusters, 0)
 
-        while registry.num_clusters() > config.target_clusters:
-            round_num += 1
-            clusters_before = registry.num_clusters()
-            print(f"\n{'='*60}")
-            print(f"MERGE ROUND {round_num}  |  clusters={clusters_before}")
-            print(f"{'='*60}")
-
-            print("Phase 1 — Caching activations …")
-            act_cache = cache_activations(model, dataset, tokenizer)
-
-            print("Phase 1 — Building distance matrix …")
-            dist_mat = build_distance_matrix(model, registry, act_cache)
-            logger.mark_phase(f"round_{round_num}_distance_matrix")
-            logger.write_json()
-
-            sorted_pairs = sorted(dist_mat.items(), key=lambda kv: kv[1])
-            print("  Top-5 closest pairs:")
-            for (ca, cb), d in sorted_pairs[:5]:
-                print(f"    clusters ({ca},{cb})  D={d:.6f}")
-
-            candidate = pick_merge_candidate(dist_mat, registry)
-            if candidate is None:
-                print("  No valid merge candidates remain. Stopping.")
-                logger.mark_phase("no_valid_merge_candidates")
-                logger.write_json()
-                break
-
-            cid_a, cid_b, dist = candidate
-            members_a = list(registry.clusters[cid_a].members)
-            members_b = list(registry.clusters[cid_b].members)
-            print(f"\n  → Selected: cluster {cid_a} ∪ cluster {cid_b}  (D={dist:.6f})")
-            print(f"    Members A={members_a}  Members B={members_b}")
-
-            pre_merge_state = snapshot_model_state(model)
-            pre_merge_registry = copy.deepcopy(registry)
-
-            rep_a_layer_idx = registry.clusters[cid_a].shared_layer_idx
-            rep_b_layer_idx = registry.clusters[cid_b].shared_layer_idx
-            all_members = members_a + members_b
-
-            print("\nPhase 2 — Soft alignment setup …")
-            print(f"  Representative A: layer {rep_a_layer_idx}")
-            print(f"  Representative B: layer {rep_b_layer_idx}")
-            print(f"  Active members   : {all_members}")
-
-            print(f"\nPhase 3 — Alignment training ({ALIGN_STEPS} steps) …")
-            alignment_training(
-                model, dataset, tokenizer,
-                registry, cid_a, cid_b,
-                frozen_originals, rep_a_layer_idx, rep_b_layer_idx,
-                round_num=round_num,
-                logger=logger,
-            )
-            logger.write_checkpoint(f"round_{round_num}_alignment")
-
-            print("\nPhase 4 — Evaluating post-alignment …")
-            L_post_align = evaluate(model, dataset, tokenizer)
-            delta_align = L_post_align - L_orig
-            print(f"  L_post_align={L_post_align:.4f}  ΔL={delta_align:+.4f}")
-
-            PPL_post_align = compute_perplexity(model, eval_dataset, tokenizer)
-            delta_ppl_align = PPL_post_align - PPL_base
-            rel_align = safe_percent_delta(PPL_post_align, PPL_base)
-            print(f"  PPL_post_align={PPL_post_align:.2f}  ΔPPL={delta_ppl_align:+.2f}  %Δ={rel_align:+.2f}%")
-
-            merge_record = {
-                "round": round_num,
-                "clusters_before": clusters_before,
-                "merge_pair": [cid_a, cid_b],
-                "distance": dist,
-                "members_A": members_a,
-                "members_B": members_b,
-                "representative_candidates": {
-                    "layer_A": rep_a_layer_idx,
-                    "layer_B": rep_b_layer_idx,
-                },
-                "L_post_align": L_post_align,
-                "delta_L_align": delta_align,
-                "PPL_post_align": PPL_post_align,
-                "delta_PPL": delta_ppl_align,
-                "percent_delta_PPL": rel_align,
-            }
-
-            if delta_align > THRESH_BAD:
-                print(f"  ✗ ΔL={delta_align:.4f} > {THRESH_BAD} — REJECTING merge, rolling back.")
-                restore_model_state(model, pre_merge_state)
-                registry = pre_merge_registry
-                registry.forbid_pair(cid_a, cid_b)
-                merge_record.update({
-                    "accepted": False,
-                    "rejection_reason": f"delta_L_align > {THRESH_BAD}",
-                    "forbidden_pair_after_reject": [cid_a, cid_b],
+        merge_progress = tqdm(
+            total=merge_rounds_total,
+            desc="Merge rounds",
+            leave=True,
+        )
+        try:
+            while registry.num_clusters() > config.target_clusters:
+                round_num += 1
+                clusters_before = registry.num_clusters()
+                merge_progress.update(1)
+                merge_progress.set_postfix({
+                    "clusters": clusters_before,
+                    "target": config.target_clusters,
                 })
+                print(f"\n{'='*60}")
+                print(f"MERGE ROUND {round_num}  |  clusters={clusters_before}")
+                print(f"{'='*60}")
+
+                print("Phase 1 — Caching activations …")
+                act_cache = cache_activations(model, dataset, tokenizer)
+
+                print("Phase 1 — Building distance matrix …")
+                dist_mat = build_distance_matrix(model, registry, act_cache)
+                logger.mark_phase(f"round_{round_num}_distance_matrix")
+                logger.write_json()
+
+                sorted_pairs = sorted(dist_mat.items(), key=lambda kv: kv[1])
+                print("  Top-5 closest pairs:")
+                for (ca, cb), d in sorted_pairs[:5]:
+                    print(f"    clusters ({ca},{cb})  D={d:.6f}")
+
+                candidate = pick_merge_candidate(dist_mat, registry)
+                if candidate is None:
+                    print("  No valid merge candidates remain. Stopping.")
+                    logger.mark_phase("no_valid_merge_candidates")
+                    logger.write_json()
+                    break
+
+                cid_a, cid_b, dist = candidate
+                members_a = list(registry.clusters[cid_a].members)
+                members_b = list(registry.clusters[cid_b].members)
+                print(f"\n  → Selected: cluster {cid_a} ∪ cluster {cid_b}  (D={dist:.6f})")
+                print(f"    Members A={members_a}  Members B={members_b}")
+
+                pre_merge_state = snapshot_model_state(model)
+                pre_merge_registry = copy.deepcopy(registry)
+
+                rep_a_layer_idx = registry.clusters[cid_a].shared_layer_idx
+                rep_b_layer_idx = registry.clusters[cid_b].shared_layer_idx
+                all_members = members_a + members_b
+
+                print("\nPhase 2 — Soft alignment setup …")
+                print(f"  Representative A: layer {rep_a_layer_idx}")
+                print(f"  Representative B: layer {rep_b_layer_idx}")
+                print(f"  Active members   : {all_members}")
+
+                print(f"\nPhase 3 — Alignment training ({ALIGN_STEPS} steps) …")
+                alignment_training(
+                    model, dataset, tokenizer,
+                    registry, cid_a, cid_b,
+                    frozen_originals, rep_a_layer_idx, rep_b_layer_idx,
+                    round_num=round_num,
+                    logger=logger,
+                )
+                logger.write_checkpoint(f"round_{round_num}_alignment")
+
+                print("\nPhase 4 — Evaluating post-alignment …")
+                L_post_align = evaluate(model, dataset, tokenizer)
+                delta_align = L_post_align - L_orig
+                print(f"  L_post_align={L_post_align:.4f}  ΔL={delta_align:+.4f}")
+
+                PPL_post_align = compute_perplexity(model, eval_dataset, tokenizer)
+                delta_ppl_align = PPL_post_align - PPL_base
+                rel_align = safe_percent_delta(PPL_post_align, PPL_base)
+                print(f"  PPL_post_align={PPL_post_align:.2f}  ΔPPL={delta_ppl_align:+.2f}  %Δ={rel_align:+.2f}%")
+
+                merge_record = {
+                    "round": round_num,
+                    "clusters_before": clusters_before,
+                    "merge_pair": [cid_a, cid_b],
+                    "distance": dist,
+                    "members_A": members_a,
+                    "members_B": members_b,
+                    "representative_candidates": {
+                        "layer_A": rep_a_layer_idx,
+                        "layer_B": rep_b_layer_idx,
+                    },
+                    "L_post_align": L_post_align,
+                    "delta_L_align": delta_align,
+                    "PPL_post_align": PPL_post_align,
+                    "delta_PPL": delta_ppl_align,
+                    "percent_delta_PPL": rel_align,
+                }
+
+                if delta_align > THRESH_BAD:
+                    print(f"  ✗ ΔL={delta_align:.4f} > {THRESH_BAD} — REJECTING merge, rolling back.")
+                    restore_model_state(model, pre_merge_state)
+                    registry = pre_merge_registry
+                    registry.forbid_pair(cid_a, cid_b)
+                    merge_record.update({
+                        "accepted": False,
+                        "rejection_reason": f"delta_L_align > {THRESH_BAD}",
+                        "forbidden_pair_after_reject": [cid_a, cid_b],
+                    })
+                    merge_history.append(merge_record)
+                    logger.append_merge(merge_record)
+                    logger.write_checkpoint(f"round_{round_num}_rejected")
+                    continue
+
+                print("\nPhase 5 — Collapsing to representative base …")
+                representative_cluster, representative_layer_idx = collapse_pair_to_representative(
+                    model, registry, cid_a, cid_b, config.rank
+                )
+                print(f"  Representative cluster: {representative_cluster}")
+                print(f"  Representative layer  : {representative_layer_idx}")
+
+                print("\nPhase 5 — Committing merge …")
+                new_cid = registry.merge(cid_a, cid_b, representative_layer_idx)
+                print(f"  New cluster {new_cid}: {registry.clusters[new_cid].members}")
+                assert_shared_ffn_ties(model, registry)
+                logger.write_checkpoint(f"round_{round_num}_merge_committed")
+
+                print(f"\nPhase 6 — Recovery fine-tuning ({RECOVERY_STEPS} steps) …")
+                recovery_finetune(model, dataset, tokenizer, round_num=round_num, logger=logger)
+                logger.write_checkpoint(f"round_{round_num}_recovery")
+
+                L_final = evaluate(model, dataset, tokenizer)
+                delta_fin = L_final - L_orig
+                PPL_final_round = compute_perplexity(model, eval_dataset, tokenizer)
+                delta_ppl_final = PPL_final_round - PPL_base
+                rel_final = safe_percent_delta(PPL_final_round, PPL_base)
+                print(f"\n  L_final={L_final:.4f}  ΔL={delta_fin:+.4f}")
+
+                grade = ("excellent" if delta_fin < THRESH_EXCELLENT
+                         else "acceptable" if delta_fin < THRESH_ACCEPTABLE
+                         else "borderline")
+                print(f"  Grade: {grade}")
+
+                print("\n  Current cluster state:")
+                print(registry.summary())
+
+                after_total = count_params_total(model)
+                after_unique = count_params_unique(model)
+                cr = compression_ratio(before_unique, after_unique)
+
+                print(f"  Params total  : {after_total:,}")
+                print(f"  Params unique : {after_unique:,}")
+                print(f"  Compression   : {cr:.2f}%")
+
+                merge_record.update({
+                    "accepted": True,
+                    "representative_cluster": representative_cluster,
+                    "representative_layer": representative_layer_idx,
+                    "new_cluster": new_cid,
+                    "members": list(registry.clusters[new_cid].members),
+                    "clusters_after": registry.num_clusters(),
+                    "L_final": L_final,
+                    "delta_L_final": delta_fin,
+                    "PPL_final": PPL_final_round,
+                    "delta_PPL_final": delta_ppl_final,
+                    "percent_delta_PPL_final": rel_final,
+                    "grade": grade,
+                    "params_total_after": after_total,
+                    "params_unique_after": after_unique,
+                    "compression_after": cr,
+                })
+
                 merge_history.append(merge_record)
                 logger.append_merge(merge_record)
-                logger.write_checkpoint(f"round_{round_num}_rejected")
-                continue
-
-            print("\nPhase 5 — Collapsing to representative base …")
-            representative_cluster, representative_layer_idx = collapse_pair_to_representative(
-                model, registry, cid_a, cid_b, config.rank
-            )
-            print(f"  Representative cluster: {representative_cluster}")
-            print(f"  Representative layer  : {representative_layer_idx}")
-
-            print("\nPhase 5 — Committing merge …")
-            new_cid = registry.merge(cid_a, cid_b, representative_layer_idx)
-            print(f"  New cluster {new_cid}: {registry.clusters[new_cid].members}")
-            assert_shared_ffn_ties(model, registry)
-            logger.write_checkpoint(f"round_{round_num}_merge_committed")
-
-            print(f"\nPhase 6 — Recovery fine-tuning ({RECOVERY_STEPS} steps) …")
-            recovery_finetune(model, dataset, tokenizer, round_num=round_num, logger=logger)
-            logger.write_checkpoint(f"round_{round_num}_recovery")
-
-            L_final = evaluate(model, dataset, tokenizer)
-            delta_fin = L_final - L_orig
-            PPL_final_round = compute_perplexity(model, eval_dataset, tokenizer)
-            delta_ppl_final = PPL_final_round - PPL_base
-            rel_final = safe_percent_delta(PPL_final_round, PPL_base)
-            print(f"\n  L_final={L_final:.4f}  ΔL={delta_fin:+.4f}")
-
-            grade = ("excellent" if delta_fin < THRESH_EXCELLENT
-                     else "acceptable" if delta_fin < THRESH_ACCEPTABLE
-                     else "borderline")
-            print(f"  Grade: {grade}")
-
-            print("\n  Current cluster state:")
-            print(registry.summary())
-
-            after_total = count_params_total(model)
-            after_unique = count_params_unique(model)
-            cr = compression_ratio(before_unique, after_unique)
-
-            print(f"  Params total  : {after_total:,}")
-            print(f"  Params unique : {after_unique:,}")
-            print(f"  Compression   : {cr:.2f}%")
-
-            merge_record.update({
-                "accepted": True,
-                "representative_cluster": representative_cluster,
-                "representative_layer": representative_layer_idx,
-                "new_cluster": new_cid,
-                "members": list(registry.clusters[new_cid].members),
-                "clusters_after": registry.num_clusters(),
-                "L_final": L_final,
-                "delta_L_final": delta_fin,
-                "PPL_final": PPL_final_round,
-                "delta_PPL_final": delta_ppl_final,
-                "percent_delta_PPL_final": rel_final,
-                "grade": grade,
-                "params_total_after": after_total,
-                "params_unique_after": after_unique,
-                "compression_after": cr,
-            })
-
-            merge_history.append(merge_record)
-            logger.append_merge(merge_record)
-            logger.write_checkpoint(f"round_{round_num}_logged")
+                logger.write_checkpoint(f"round_{round_num}_logged")
+        finally:
+            merge_progress.close()
 
         print("\n" + "=" * 60)
         print("PIPELINE COMPLETE")
