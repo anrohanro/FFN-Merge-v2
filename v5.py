@@ -190,6 +190,67 @@ class PipelineConfig:
     model_name: str = MODEL_NAME
     target_clusters: int = TARGET_CLUSTERS
     rank: int = LORA_RANK
+    save: bool = False
+
+
+def build_output_dir_name(config: PipelineConfig) -> str:
+    safe_model_name = config.model_name.replace("/", "_")
+    return f"{safe_model_name}_clusters{config.target_clusters}_rank{config.rank}"
+
+
+def export_final_artifacts(
+    model,
+    tokenizer,
+    config: PipelineConfig,
+    registry: "ClusterRegistry",
+    log_path: Path,
+    compression_percent: float,
+    final_ppl: float,
+) -> Path:
+    output_dir = Path("outputs") / build_output_dir_name(config)
+    model_dir = output_dir / "model"
+    tokenizer_dir = output_dir / "tokenizer"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+
+    model.save_pretrained(model_dir)
+    tokenizer.save_pretrained(tokenizer_dir)
+
+    config_payload = {
+        "model_name": config.model_name,
+        "target_clusters": config.target_clusters,
+        "rank": config.rank,
+        "num_clusters_final": registry.num_clusters(),
+    }
+    (output_dir / "config.json").write_text(
+        json.dumps(config_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    cluster_payload = {
+        "clusters": {
+            str(cluster.cluster_id): cluster.members
+            for cluster in sorted(registry.clusters.values(), key=lambda c: c.cluster_id)
+        }
+    }
+    (output_dir / "clusters.json").write_text(
+        json.dumps(cluster_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    metadata_payload = {
+        "log_file": str(log_path),
+        "compression_percent": compression_percent,
+        "final_ppl": final_ppl,
+    }
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    return output_dir
 
 
 class RunLogger:
@@ -1271,11 +1332,13 @@ def run_pipeline(
     model_name: str = MODEL_NAME,
     target_clusters: int = TARGET_CLUSTERS,
     rank: int = LORA_RANK,
+    save: bool = False,
 ):
     config = PipelineConfig(
         model_name=model_name,
         target_clusters=target_clusters,
         rank=rank,
+        save=save,
     )
     logger = RunLogger(config, DEVICE)
     merge_history = []
@@ -1586,7 +1649,19 @@ def run_pipeline(
             print(" ", json.dumps(entry, indent=2))
 
         logger.finalize(status="completed", phase_name="complete")
-        return model, registry, merge_history, logger.json_path
+        output_dir = None
+        if config.save:
+            output_dir = export_final_artifacts(
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                registry=registry,
+                log_path=logger.json_path,
+                compression_percent=final_compression,
+                final_ppl=PPL_post_uptrain,
+            )
+            print(f"\nSaved final artifacts to: {output_dir}")
+        return model, registry, merge_history, logger.json_path, output_dir
     except Exception as exc:
         logger.set_status("failed", logger.data.get("last_completed_phase", "failed"), error=str(exc))
         logger.finalize(status="failed", phase_name=logger.data.get("last_completed_phase", "failed"))
@@ -1614,6 +1689,12 @@ def parse_args() -> argparse.Namespace:
         default=LORA_RANK,
         help="LoRA rank used for parameter-efficient adaptation.",
     )
+    parser.add_argument(
+        "--save",
+        type=int,
+        default=0,
+        help="Set to 1 to save the final model, tokenizer, config, clusters, and metadata.",
+    )
     return parser.parse_args()
 
 
@@ -1622,6 +1703,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--target_clusters must be a positive integer.")
     if args.rank <= 0:
         raise ValueError("--rank must be a positive integer.")
+    if args.save not in (0, 1):
+        raise ValueError("--save must be 0 or 1.")
 
 
 # =============================================================================
@@ -1630,9 +1713,12 @@ def validate_args(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     args = parse_args()
     validate_args(args)
-    model, registry, history, log_path = run_pipeline(
+    model, registry, history, log_path, output_dir = run_pipeline(
         model_name=args.model_name,
         target_clusters=args.target_clusters,
         rank=args.rank,
+        save=bool(args.save),
     )
     print(f"\nRun log saved to: {log_path}")
+    if output_dir is not None:
+        print(f"Final model bundle saved to: {output_dir}")
