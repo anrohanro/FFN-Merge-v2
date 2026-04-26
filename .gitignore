@@ -1,4 +1,5 @@
 commands.txt
 hf_cache/
 logs/
+logs_*
 outputs/
