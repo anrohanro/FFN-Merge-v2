@@ -26,6 +26,72 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+# =============================================================================
+# FINAL CONFIG (STABLE + GOOD PPL)
+# =============================================================================
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = "gpt2"
+
+TRAIN_DATASET_NAME = "wikitext-2 train"
+VALIDATION_DATASET_NAME = "wikitext-2 validation"
+TEST_DATASET_NAME = "wikitext-2 test"
+UPTRAIN_DATASET_NAME = "openwebtext train[:10%]"   # 🔥 important
+
+# -----------------------
+# DATA
+# -----------------------
+BATCH_SIZE = 8
+SEQ_LEN = 64
+CALIB_BATCHES = 40        # 🔥 from 3 → 20
+# HIDDEN_DISTILL_LAYERS = list(range(0, len(model.transformer.h), 2))
+BETA_HIDDEN =0.5
+# -----------------------
+# ALIGNMENT
+# -----------------------
+ALIGN_STEPS = 2500        # 🔥 from 500 → 1500
+LR_ALIGN = 3e-5
+
+LAMBDA_MAX = 6.0          # 🔥 from 1.0 → 3.0
+MU = 1.0                  # 🔥 from 0.5 → 1.0
+WARMUP_FRAC = 0.3
+
+# -----------------------
+# LORA
+# -----------------------
+LORA_RANK = 8             # 🔥 from 4 → 8
+
+# -----------------------
+# MERGING
+# -----------------------
+TARGET_CLUSTERS = 11       # 🔥 from 6 → 8
+
+THRESH_EXCELLENT = 0.1
+THRESH_ACCEPTABLE = 0.3
+THRESH_BAD = 0.5          # 🔥 stricter than 1.0
+
+# -----------------------
+# RECOVERY
+# -----------------------
+RECOVERY_STEPS = 200
+LR_RECOVERY = 1e-5
+
+# -----------------------
+# UPTRAINING
+# -----------------------
+UPTRAIN_STEPS = 4000      # 🔥 from 1000 → 2000
+LR_UPTRAIN = 5e-6         # 🔥 from 1e-5 → lower
+KD_ALPHA = 1.0            # 🔥 from 0.5 → 1.0
+KD_TEMPERATURE = 2.0
+
+UPTRAIN_LOG_INTERVAL = 100
+
+# -----------------------
+# LOGGING
+# -----------------------
+ALIGN_LOG_INTERVAL = 100
+RECOVERY_LOG_INTERVAL = 50
+
 # # =============================================================================
 # # CONFIG FINAL RUN
 # # =============================================================================
@@ -48,6 +114,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # UPTRAIN_STEPS  = 1000       # smoke-run final global uptraining
 # LR_UPTRAIN     = 1e-5
 # KD_ALPHA       = 0.5
+# KD_TEMPERATURE = 2.0
 # UPTRAIN_LOG_INTERVAL = 100
 
 # LAMBDA_MAX     = 1.0      # weaker constraint (faster convergence)
@@ -71,42 +138,42 @@ from typing import Any, Dict, List, Optional, Tuple
 # =============================================================================
 # CONFIG SMOKE RUN
 # =============================================================================
-DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_NAME     = "gpt2"
-TRAIN_DATASET_NAME = "wikitext-2 train"
-VALIDATION_DATASET_NAME = "wikitext-2 validation"
-TEST_DATASET_NAME = "wikitext-2 test"
-UPTRAIN_DATASET_NAME = "openwebtext train[:1%]"
+# DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+# MODEL_NAME     = "gpt2"
+# TRAIN_DATASET_NAME = "wikitext-2 train"
+# VALIDATION_DATASET_NAME = "wikitext-2 validation"
+# TEST_DATASET_NAME = "wikitext-2 test"
+# UPTRAIN_DATASET_NAME = "openwebtext train[:1%]"
 
-BATCH_SIZE     = 2        # tiny batch
-SEQ_LEN        = 32       # shorter sequences
-CALIB_BATCHES  = 3        # minimal for distance
+# BATCH_SIZE     = 2        # tiny batch
+# SEQ_LEN        = 32       # shorter sequences
+# CALIB_BATCHES  = 3        # minimal for distance
 
-ALIGN_STEPS    = 50       # just to check training loop
-RECOVERY_STEPS = 20       # quick stabilization
+# ALIGN_STEPS    = 50       # just to check training loop
+# RECOVERY_STEPS = 20       # quick stabilization
 
-LR_ALIGN       = 5e-5     # slightly higher → faster movement
-LR_RECOVERY    = 2e-5
-UPTRAIN_STEPS  = 5       # smoke-run final global uptraining
-LR_UPTRAIN     = 1e-5
-KD_ALPHA       = 0.5
-UPTRAIN_LOG_INTERVAL = 10
+# LR_ALIGN       = 5e-5     # slightly higher → faster movement
+# LR_RECOVERY    = 2e-5
+# UPTRAIN_STEPS  = 5       # smoke-run final global uptraining
+# LR_UPTRAIN     = 1e-5
+# KD_ALPHA       = 0.5
+# UPTRAIN_LOG_INTERVAL = 10
 
-LAMBDA_MAX     = 1.0      # weaker constraint (faster convergence)
-MU             = 0.5      # lighter anchor
+# LAMBDA_MAX     = 1.0      # weaker constraint (faster convergence)
+# MU             = 0.5      # lighter anchor
 
-LORA_RANK      = 1        # smaller → faster & less memory
-WARMUP_FRAC    = 0.2
+# LORA_RANK      = 1        # smaller → faster & less memory
+# WARMUP_FRAC    = 0.2
 
-TARGET_CLUSTERS = 5      # only 1–2 merges (from 12 → 10)
+# TARGET_CLUSTERS = 5      # only 1–2 merges (from 12 → 10)
 
-THRESH_EXCELLENT  = 0.2
-THRESH_ACCEPTABLE = 0.5
-THRESH_BAD        = 1.0   # very lenient → avoid rejection loops
-ALIGN_LOG_INTERVAL = 200
-RECOVERY_LOG_INTERVAL = 100
+# THRESH_EXCELLENT  = 0.2
+# THRESH_ACCEPTABLE = 0.5
+# THRESH_BAD        = 1.0   # very lenient → avoid rejection loops
+# ALIGN_LOG_INTERVAL = 200
+# RECOVERY_LOG_INTERVAL = 100
 
-# NUM_LAYERS = 12
+# # NUM_LAYERS = 12
 
 
 # =============================================================================
@@ -295,6 +362,7 @@ class RunLogger:
                     "UPTRAIN_STEPS": UPTRAIN_STEPS,
                     "LR_UPTRAIN": LR_UPTRAIN,
                     "KD_ALPHA": KD_ALPHA,
+                    "KD_TEMPERATURE": KD_TEMPERATURE,
                     "LAMBDA_MAX": LAMBDA_MAX,
                     "MU": MU,
                     "TARGET_CLUSTERS": config.target_clusters,
@@ -690,7 +758,7 @@ def build_test_dataset():
     return load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
 
 def build_uptraining_dataset():
-    return load_dataset("openwebtext", split="train[:1%]")
+    return load_dataset("openwebtext", split="train[:10%]")
 
 
 def get_batch(dataset, tokenizer) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -820,16 +888,23 @@ def kd_kl_student_teacher(
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
     """
-    KL(p_student || p_teacher) over non-padded tokens.
+    Temperature-scaled KL over non-padded tokens.
     """
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
-    student_probs = student_log_probs.exp()
+    token_mask = attention_mask.to(dtype=torch.bool)
+    masked_student_logits = student_logits[token_mask]
+    masked_teacher_logits = teacher_logits[token_mask]
 
-    token_kl = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
-    mask = attention_mask.to(token_kl.dtype)
-    denom = mask.sum().clamp_min(1.0)
-    return (token_kl * mask).sum() / denom
+    if masked_student_logits.numel() == 0:
+        return student_logits.new_tensor(0.0)
+
+    student_log_probs = F.log_softmax(masked_student_logits / KD_TEMPERATURE, dim=-1)
+    teacher_probs = F.softmax(masked_teacher_logits / KD_TEMPERATURE, dim=-1)
+
+    return F.kl_div(
+        student_log_probs,
+        teacher_probs,
+        reduction="batchmean",
+    ) * (KD_TEMPERATURE * KD_TEMPERATURE)
 # =============================================================================
 # PHASE 1 — DISTANCE MATRIX
 # =============================================================================
@@ -1179,12 +1254,12 @@ def uptraining_phase(
     registry: ClusterRegistry,
     logger: Optional[RunLogger] = None,
     steps: int = UPTRAIN_STEPS,
+    beta_hidden: float = BETA_HIDDEN,
+    hidden_layers: Optional[List[int]] = None,
 ) -> None:
-    """
-    Final global uptraining with LM loss + teacher-guided distillation.
-    All student parameters that require grad remain trainable.
-    Shared FFN references are audited throughout the phase.
-    """
+    if hidden_layers is None:
+        hidden_layers = list(range(0, len(model.transformer.h), 2))
+
     model.train()
     teacher.eval()
     assert_shared_ffn_ties(model, registry)
@@ -1192,11 +1267,7 @@ def uptraining_phase(
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=LR_UPTRAIN)
 
-    for step in tqdm(
-        range(steps),
-        desc="Uptraining",
-        leave=False,
-    ):
+    for step in tqdm(range(steps), desc="Uptraining", leave=False):
         x, mask = get_batch(dataset, tokenizer)
         optimizer.zero_grad()
 
@@ -1204,6 +1275,7 @@ def uptraining_phase(
             x,
             attention_mask=mask,
             labels=x,
+            output_hidden_states=True,
         )
         loss_lm = student_outputs.loss
 
@@ -1211,6 +1283,7 @@ def uptraining_phase(
             teacher_outputs = teacher(
                 x,
                 attention_mask=mask,
+                output_hidden_states=True,
             )
 
         loss_kd = kd_kl_student_teacher(
@@ -1218,7 +1291,16 @@ def uptraining_phase(
             teacher_outputs.logits,
             mask,
         )
-        loss = loss_lm + KD_ALPHA * loss_kd
+
+        loss_hidden = torch.tensor(0.0, device=DEVICE)
+        for layer_idx in hidden_layers:
+            hs_idx = layer_idx + 1  # hs[0] is embedding output; block i → hs[i+1]
+            s_h = student_outputs.hidden_states[hs_idx]
+            t_h = teacher_outputs.hidden_states[hs_idx].detach()
+            loss_hidden = loss_hidden + F.mse_loss(s_h, t_h)
+        loss_hidden = loss_hidden / max(len(hidden_layers), 1)
+
+        loss = loss_lm + KD_ALPHA * loss_kd + beta_hidden * loss_hidden
         loss.backward()
         optimizer.step()
 
@@ -1230,6 +1312,7 @@ def uptraining_phase(
                     "step": step,
                     "lm_loss": loss_lm.item(),
                     "kd_loss": loss_kd.item(),
+                    "hidden_loss": loss_hidden.item(),
                     "total_loss": loss.item(),
                     "val_ppl": val_ppl,
                 })
@@ -1237,11 +1320,84 @@ def uptraining_phase(
                 f"  [uptrain {step:4d}] "
                 f"LM={loss_lm.item():.4f}  "
                 f"KD={loss_kd.item():.4f}  "
+                f"Hidden={loss_hidden.item():.4f}  "
                 f"Total={loss.item():.4f}  "
                 f"ValPPL={val_ppl:.2f}"
             )
 
     assert_shared_ffn_ties(model, registry)
+# def uptraining_phase(
+#     model,
+#     teacher,
+#     dataset,
+#     eval_dataset,
+#     tokenizer,
+#     registry: ClusterRegistry,
+#     logger: Optional[RunLogger] = None,
+#     steps: int = UPTRAIN_STEPS,
+# ) -> None:
+#     """
+#     Final global uptraining with LM loss + teacher-guided distillation.
+#     All student parameters that require grad remain trainable.
+#     Shared FFN references are audited throughout the phase.
+#     """
+#     model.train()
+#     teacher.eval()
+#     assert_shared_ffn_ties(model, registry)
+
+#     params = [p for p in model.parameters() if p.requires_grad]
+#     optimizer = torch.optim.AdamW(params, lr=LR_UPTRAIN)
+
+#     for step in tqdm(
+#         range(steps),
+#         desc="Uptraining",
+#         leave=False,
+#     ):
+#         x, mask = get_batch(dataset, tokenizer)
+#         optimizer.zero_grad()
+
+#         student_outputs = model(
+#             x,
+#             attention_mask=mask,
+#             labels=x,
+#         )
+#         loss_lm = student_outputs.loss
+
+#         with torch.no_grad():
+#             teacher_outputs = teacher(
+#                 x,
+#                 attention_mask=mask,
+#             )
+
+#         loss_kd = kd_kl_student_teacher(
+#             student_outputs.logits,
+#             teacher_outputs.logits,
+#             mask,
+#         )
+#         loss = loss_lm + KD_ALPHA * loss_kd
+#         loss.backward()
+#         optimizer.step()
+
+#         if step % UPTRAIN_LOG_INTERVAL == 0 or step == steps - 1:
+#             assert_shared_ffn_ties(model, registry)
+#             val_ppl = compute_perplexity(model, eval_dataset, tokenizer)
+#             if logger is not None:
+#                 logger.append_phase_metric("uptraining", {
+#                     "step": step,
+#                     "lm_loss": loss_lm.item(),
+#                     "kd_loss": loss_kd.item(),
+#                     "total_loss": loss.item(),
+#                     "val_ppl": val_ppl,
+#                 })
+#             print(
+#                 f"  [uptrain {step:4d}] "
+#                 f"LM={loss_lm.item():.4f}  "
+#                 f"KD={loss_kd.item():.4f}  "
+#                 f"Total={loss.item():.4f}  "
+#                 f"ValPPL={val_ppl:.2f}"
+#             )
+
+#     assert_shared_ffn_ties(model, registry)
 
 
 # =============================================================================
